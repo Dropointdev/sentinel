@@ -15,13 +15,15 @@ const app  = express();
 const PORT = process.env.PORT || 4000;
 
 app.use(cors());
-app.use(express.json());
+app.use((req, res, next) => {
+  if (req.path === '/whep') return next();
+  express.json()(req, res, next);
+});
 
 // Start MediaMTX immediately on boot
 startMediaMTX();
 
 // ─── WHEP PROXY ───────────────────────────────────────────────────────────────
-// Browser can't reach localhost:8889 on Render — proxy through Express instead
 app.post('/whep', (req, res) => {
   let body = '';
   req.on('data', d => body += d);
@@ -39,18 +41,29 @@ app.post('/whep', (req, res) => {
 
     const proxy = http.request(options, proxyRes => {
       res.status(proxyRes.statusCode);
+      // Forward all headers from MediaMTX
       Object.entries(proxyRes.headers).forEach(([k, v]) => res.setHeader(k, v));
+      // Add CORS
+      res.setHeader('Access-Control-Allow-Origin', '*');
       proxyRes.pipe(res);
     });
 
     proxy.on('error', err => {
       console.error('[WHEP PROXY] Error:', err.message);
-      res.status(502).json({ error: 'MediaMTX not reachable' });
+      res.status(502).json({ error: 'MediaMTX not reachable: ' + err.message });
     });
 
     proxy.write(body);
     proxy.end();
   });
+});
+
+// Handle preflight
+app.options('/whep', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.sendStatus(204);
 });
 
 // ─── GET STREAM ───────────────────────────────────────────────────────────────
