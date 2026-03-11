@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>SENTINEL — Live Monitor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow+Condensed:wght@300;400;600;700&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:      #090b0f;
+      --surface: #0e1117;
+      --border:  #1c2230;
+      --accent:  #00e5ff;
+      --red:     #ff3b3b;
+      --green:   #00ff88;
+      --text:    #c8d6e5;
+      --muted:   #4a5568;
+      --mono:    'Share Tech Mono', monospace;
+      --sans:    'Barlow Condensed', sans-serif;
+    }
+
+    html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--sans); overflow-x: hidden; }
+
+    body::after {
+      content: '';
+      position: fixed; inset: 0;
+      background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.04) 2px, rgba(0,0,0,0.04) 4px);
+      pointer-events: none; z-index: 9999;
+    }
+
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 28px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      position: sticky; top: 0; z-index: 100;
+    }
+    .logo { font-family: var(--sans); font-weight: 700; font-size: 22px; letter-spacing: 6px; color: var(--accent); }
+    .logo span { color: var(--text); font-weight: 300; }
+    .header-meta { display: flex; align-items: center; gap: 24px; }
+    .live-badge {
+      display: flex; align-items: center; gap: 8px;
+      font-family: var(--mono); font-size: 11px; color: var(--green); letter-spacing: 2px;
+    }
+    .live-badge .dot {
+      width: 8px; height: 8px; border-radius: 50%; background: var(--green);
+      animation: blink 1.4s ease-in-out infinite;
+    }
+    @keyframes blink { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.4;transform:scale(.7)} }
+    #clock { font-family: var(--mono); font-size: 13px; color: var(--muted); letter-spacing: 1px; }
+
+    .toolbar {
+      display: flex; align-items: center; gap: 10px;
+      padding: 10px 28px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(14,17,23,0.9);
+      flex-wrap: wrap;
+    }
+    .tlabel { font-size: 11px; letter-spacing: 3px; color: var(--muted); text-transform: uppercase; }
+    .btn {
+      font-family: var(--sans); font-size: 12px; font-weight: 600; letter-spacing: 2px;
+      text-transform: uppercase; padding: 7px 16px;
+      border: 1px solid var(--border); background: transparent; color: var(--text);
+      cursor: pointer; transition: all .15s;
+    }
+    .btn:hover { border-color: var(--accent); color: var(--accent); }
+    .btn.primary { border-color: var(--accent); color: var(--accent); }
+    .btn.primary:hover { background: var(--accent); color: var(--bg); }
+    .btn.danger { border-color: var(--red); color: var(--red); }
+    .btn.danger:hover { background: var(--red); color: #fff; }
+    .btn.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+    .spacer { margin-left: auto; }
+    .quality-toggle { display: flex; gap: 0; }
+    .quality-toggle .btn { padding: 7px 12px; }
+    .quality-toggle .btn:first-child { border-right: none; }
+
+    main { padding: 20px 28px; display: flex; flex-direction: column; gap: 16px; }
+
+    .camera-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      overflow: hidden;
+      position: relative;
+      transition: border-color .2s, box-shadow .2s;
+    }
+    .camera-card:hover {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px var(--accent), 0 0 40px rgba(0,229,255,.06);
+    }
+    .camera-card::before, .camera-card::after {
+      content: ''; position: absolute; width: 18px; height: 18px; z-index: 10; pointer-events: none;
+    }
+    .camera-card::before { top: 10px; left: 10px; border-top: 2px solid var(--accent); border-left: 2px solid var(--accent); }
+    .camera-card::after  { bottom: 44px; right: 10px; border-bottom: 2px solid var(--accent); border-right: 2px solid var(--accent); }
+
+    .video-wrap { position: relative; aspect-ratio: 16/9; background: #000; }
+    video { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+    .hud {
+      position: absolute; inset: 0;
+      display: flex; flex-direction: column; justify-content: space-between;
+      padding: 14px 16px; pointer-events: none; z-index: 5;
+    }
+    .hud-top { display: flex; justify-content: space-between; align-items: flex-start; }
+    .hud-bottom { display: flex; justify-content: space-between; align-items: flex-end; }
+
+    .tag {
+      font-family: var(--mono); font-size: 10px; letter-spacing: 1px;
+      background: rgba(0,0,0,.65); padding: 3px 8px;
+    }
+    .tag.id      { color: var(--accent); }
+    .tag.live    { color: var(--green); }
+    .tag.loading { color: #ffaa00; }
+    .tag.error   { color: var(--red); }
+    .tag.idle    { color: var(--muted); }
+    .cam-title { font-size: 16px; font-weight: 600; letter-spacing: 3px; text-transform: uppercase; color: #fff; background: rgba(0,0,0,.55); padding: 4px 10px; }
+    .cam-ts    { font-family: var(--mono); font-size: 10px; color: var(--muted); background: rgba(0,0,0,.55); padding: 3px 8px; }
+
+    .placeholder {
+      position: absolute; inset: 0;
+      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px;
+      background: #07090d; z-index: 4;
+    }
+    .placeholder svg { opacity: .2; }
+    .placeholder p { font-family: var(--mono); font-size: 11px; color: var(--muted); letter-spacing: 2px; text-align: center; line-height: 2; }
+    .ph-btn {
+      pointer-events: all; font-family: var(--sans); font-size: 12px; font-weight: 600;
+      letter-spacing: 3px; text-transform: uppercase; padding: 9px 24px;
+      border: 1px solid var(--accent); background: transparent; color: var(--accent);
+      cursor: pointer; transition: all .15s;
+    }
+    .ph-btn:hover { background: var(--accent); color: var(--bg); }
+
+    .spinner {
+      position: absolute; inset: 0; display: none;
+      align-items: center; justify-content: center; background: rgba(0,0,0,.75); z-index: 6;
+    }
+    .spinner.on { display: flex; }
+    .ring {
+      width: 40px; height: 40px; border: 2px solid var(--border);
+      border-top-color: var(--accent); border-radius: 50%;
+      animation: spin .8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .card-footer {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 16px; border-top: 1px solid var(--border);
+      background: rgba(0,0,0,.3);
+    }
+    .card-footer .devid { font-family: var(--mono); font-size: 10px; color: var(--muted); letter-spacing: 1px; }
+    .card-footer .actions { display: flex; gap: 8px; }
+    .icon-btn {
+      font-family: var(--mono); font-size: 10px; letter-spacing: 2px;
+      padding: 5px 12px; border: 1px solid var(--border); background: transparent;
+      color: var(--muted); cursor: pointer; transition: all .15s; text-transform: uppercase;
+    }
+    .icon-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .icon-btn.red:hover { border-color: var(--red); color: var(--red); }
+
+    footer {
+      border-top: 1px solid var(--border); padding: 10px 28px;
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: var(--mono); font-size: 10px; color: var(--muted); letter-spacing: 1px;
+    }
+
+    #toast {
+      position: fixed; bottom: 24px; right: 24px;
+      background: var(--surface); border: 1px solid var(--accent);
+      color: var(--accent); font-family: var(--mono); font-size: 11px; letter-spacing: 1px;
+      padding: 10px 18px; transform: translateY(60px); opacity: 0;
+      transition: all .3s ease; z-index: 99999;
+    }
+    #toast.show { transform: translateY(0); opacity: 1; }
+    #toast.err  { border-color: var(--red); color: var(--red); }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">SENTINEL <span>// LIVE MONITOR</span></div>
+  <div class="header-meta">
+    <div class="live-badge"><div class="dot"></div>SYSTEM ONLINE</div>
+    <div id="clock">--:--:--</div>
+  </div>
+</header>
+
+<div class="toolbar">
+  <span class="tlabel">Stream</span>
+  <button class="btn primary" onclick="loadStream()">▶ CONNECT</button>
+  <button class="btn danger"  onclick="stopStream()">■ DISCONNECT</button>
+  <div class="spacer"></div>
+  <span class="tlabel">Quality</span>
+  <div class="quality-toggle">
+    <button class="btn active" id="q-hd" onclick="setQuality('HD')">HD</button>
+    <button class="btn"        id="q-sd" onclick="setQuality('SD')">SD</button>
+  </div>
+</div>
+
+<main id="main"></main>
+
+<footer>
+  <span id="footer-msg">AWAITING CONNECTION</span>
+  <span>SENTINEL v2.0 // WEBRTC // IMOU LIFE API</span>
+</footer>
+
+<div id="toast"></div>
+
+<script>
+// ─── STATE ────────────────────────────────────────────────────────────────────
+let DEVICE_ID      = null;
+let currentQuality = 'HD';
+let peerConnection = null;
+
+// ─── CLOCK ───────────────────────────────────────────────────────────────────
+function tick() {
+  document.getElementById('clock').textContent =
+    new Date().toLocaleTimeString('en-GB', { hour12: false });
+}
+setInterval(tick, 1000); tick();
+setInterval(() => {
+  const el = document.querySelector('.cam-ts');
+  if (el) el.textContent = new Date().toLocaleTimeString('en-GB', { hour12: false });
+}, 1000);
+
+// ─── BUILD CARD ──────────────────────────────────────────────────────────────
+function buildCard() {
+  document.getElementById('main').innerHTML = `
+    <div class="camera-card">
+      <div class="video-wrap">
+        <video id="cam-video" muted playsinline></video>
+
+        <div class="placeholder" id="placeholder">
+          <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#00e5ff" stroke-width="1">
+            <path d="M15 10l4.553-2.277A1 1 0 0121 8.723v6.554a1 1 0 01-1.447.894L15 14M3 8a2 2 0 012-2h10a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"/>
+          </svg>
+          <p>${DEVICE_ID}<br>NO SIGNAL — CLICK CONNECT</p>
+          <button class="ph-btn" onclick="loadStream()">▶ CONNECT STREAM</button>
+        </div>
+
+        <div class="spinner" id="spinner"><div class="ring"></div></div>
+
+        <div class="hud">
+          <div class="hud-top">
+            <div class="tag id">${DEVICE_ID.slice(-8)}</div>
+            <div class="tag idle" id="status-tag">NO SIGNAL</div>
+          </div>
+          <div class="hud-bottom">
+            <div class="cam-title">CAM-01</div>
+            <div class="cam-ts">--:--:--</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card-footer">
+        <div class="devid">DEVICE // ${DEVICE_ID}</div>
+        <div class="actions">
+          <button class="icon-btn" id="mute-btn" onclick="toggleMute()">MUTE</button>
+          <button class="icon-btn" onclick="toggleFullscreen()">FULLSCREEN</button>
+          <button class="icon-btn red" onclick="stopStream()">STOP</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+// ─── LOAD STREAM ─────────────────────────────────────────────────────────────
+async function loadStream() {
+  setStatus('loading', 'CONNECTING...');
+  showSpinner(true);
+  hidePlaceholder();
+  setFooter('FETCHING STREAM URL...');
+
+  try {
+    const res  = await fetch(`/api/stream/${DEVICE_ID}?quality=${currentQuality}`);
+    const json = await res.json();
+
+    if (!json.success || !json.webrtcUrl) {
+      throw new Error(json.error || 'No WebRTC URL returned');
+    }
+
+    console.log('[SENTINEL] WebRTC WHEP URL:', json.webrtcUrl);
+    await playWebRTC(json.webrtcUrl);
+    setFooter(`STREAMING // WebRTC // ${DEVICE_ID}`);
+
+  } catch (err) {
+    showSpinner(false);
+    showPlaceholder();
+    setStatus('error', '✕ ERROR');
+    setFooter('CONNECTION FAILED');
+    toast('Error: ' + err.message, true);
+    console.error('[SENTINEL]', err);
+  }
+}
+
+// ─── WEBRTC PLAYER ───────────────────────────────────────────────────────────
+async function playWebRTC(url) {
+  const video = document.getElementById('cam-video');
+
+  // Close any existing connection
+  closePeerConnection();
+
+  peerConnection = new RTCPeerConnection({
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    {
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    }
+  ]
+});
+
+  // Receive video + audio
+  peerConnection.addTransceiver('video', { direction: 'recvonly' });
+  peerConnection.addTransceiver('audio', { direction: 'recvonly' });
+
+  // When tracks arrive, attach to video element
+  peerConnection.ontrack = e => {
+    if (e.track.kind === 'video') {
+      video.srcObject = e.streams[0];
+      video.play().catch(err => console.warn('[SENTINEL] Autoplay blocked:', err));
+      showSpinner(false);
+      setStatus('live', '● LIVE');
+      toast('Stream connected');
+    }
+  };
+
+  // Monitor connection health
+  peerConnection.oniceconnectionstatechange = () => {
+    const state = peerConnection.iceConnectionState;
+    console.log('[WebRTC] ICE state:', state);
+    if (state === 'failed' || state === 'disconnected') {
+      setStatus('error', '✕ DISCONNECTED');
+      toast('WebRTC disconnected — try reconnecting', true);
+    }
+  };
+
+  // WHEP handshake: send offer, get answer
+  const offer = await peerConnection.createOffer();
+  await peerConnection.setLocalDescription(offer);
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/sdp' },
+    body: offer.sdp
+  });
+
+  if (!response.ok) throw new Error(`WHEP handshake failed: HTTP ${response.status}`);
+
+  const answerSdp = await response.text();
+  await peerConnection.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+}
+
+// ─── STOP ────────────────────────────────────────────────────────────────────
+function stopStream() {
+  closePeerConnection();
+  const video = document.getElementById('cam-video');
+  if (video) { video.pause(); video.srcObject = null; }
+  showPlaceholder();
+  setStatus('idle', 'NO SIGNAL');
+  setFooter('STREAM DISCONNECTED');
+  toast('Stream disconnected');
+
+  // Tell server to stop FFmpeg too
+  fetch('/api/stream/stop', { method: 'POST' }).catch(() => {});
+}
+
+function closePeerConnection() {
+  if (peerConnection) {
+    peerConnection.close();
+    peerConnection = null;
+  }
+}
+
+// ─── CONTROLS ────────────────────────────────────────────────────────────────
+function setQuality(q) {
+  currentQuality = q;
+  document.getElementById('q-hd').classList.toggle('active', q === 'HD');
+  document.getElementById('q-sd').classList.toggle('active', q === 'SD');
+  // Reload stream if already connected
+  if (peerConnection) {
+    stopStream();
+    setTimeout(loadStream, 500);
+  }
+}
+
+function toggleMute() {
+  const video = document.getElementById('cam-video');
+  const btn   = document.getElementById('mute-btn');
+  if (!video || !btn) return;
+  video.muted = !video.muted;
+  btn.textContent = video.muted ? 'UNMUTE' : 'MUTE';
+}
+
+function toggleFullscreen() {
+  const wrap = document.querySelector('.video-wrap');
+  if (!wrap) return;
+  if (!document.fullscreenElement) wrap.requestFullscreen();
+  else document.exitFullscreen();
+}
+
+// ─── UI HELPERS ──────────────────────────────────────────────────────────────
+function setStatus(type, text) {
+  const el = document.getElementById('status-tag');
+  if (el) { el.className = `tag ${type}`; el.textContent = text; }
+}
+function showSpinner(on) {
+  const el = document.getElementById('spinner');
+  if (el) el.classList.toggle('on', on);
+}
+function showPlaceholder() {
+  const el = document.getElementById('placeholder');
+  if (el) el.style.display = 'flex';
+}
+function hidePlaceholder() {
+  const el = document.getElementById('placeholder');
+  if (el) el.style.display = 'none';
+}
+function setFooter(msg) {
+  document.getElementById('footer-msg').textContent = msg;
+}
+function toast(msg, isErr = false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'show' + (isErr ? ' err' : '');
+  setTimeout(() => { t.className = ''; }, 3500);
+}
+
+// ─── INIT ────────────────────────────────────────────────────────────────────
+fetch('/api/health')
+  .then(r => r.json())
+  .then(d => {
+    DEVICE_ID = d.deviceId;
+    buildCard();
+    return fetch(`/api/device/${DEVICE_ID}/online`);
+  })
+  .then(r => r.json())
+  .then(d => {
+    if (d.online) {
+      setFooter('DEVICE ONLINE — READY TO STREAM');
+      toast('Device online');
+    } else {
+      setFooter('DEVICE OFFLINE');
+      toast('Device appears offline', true);
+    }
+  })
+  .catch(err => {
+    console.error('Init error:', err);
+    setFooter('INIT FAILED — check server');
+  });
+</script>
+</body>
+</html>
