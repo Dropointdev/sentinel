@@ -6,7 +6,6 @@
   <title>SENTINEL — Live Monitor</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow+Condensed:wght@300;400;600;700&display=swap" rel="stylesheet">
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.4.12/hls.min.js"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -67,6 +66,7 @@
     .icon-btn{font-family:var(--mono);font-size:10px;letter-spacing:2px;padding:5px 12px;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;transition:all .15s;text-transform:uppercase}
     .icon-btn:hover{border-color:var(--accent);color:var(--accent)}
     .icon-btn.red:hover{border-color:var(--red);color:var(--red)}
+    .latency-badge{font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:1px}
     footer{border-top:1px solid var(--border);padding:10px 28px;display:flex;align-items:center;justify-content:space-between;font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:1px}
     #toast{position:fixed;bottom:24px;right:24px;background:var(--surface);border:1px solid var(--accent);color:var(--accent);font-family:var(--mono);font-size:11px;letter-spacing:1px;padding:10px 18px;transform:translateY(60px);opacity:0;transition:all .3s ease;z-index:99999}
     #toast.show{transform:translateY(0);opacity:1}
@@ -74,7 +74,6 @@
   </style>
 </head>
 <body>
-
 <header>
   <div class="logo">SENTINEL <span>// LIVE MONITOR</span></div>
   <div class="header-meta">
@@ -82,7 +81,6 @@
     <div id="clock">--:--:--</div>
   </div>
 </header>
-
 <div class="toolbar">
   <span class="tlabel">Stream</span>
   <button class="btn primary" onclick="loadStream()">▶ CONNECT</button>
@@ -94,30 +92,28 @@
     <button class="btn"        id="q-sd" onclick="setQuality('SD')">SD</button>
   </div>
 </div>
-
 <main id="main"></main>
-
 <footer>
   <span id="footer-msg">AWAITING CONNECTION</span>
-  <span>SENTINEL v3.0 // HLS // IMOU LIFE API</span>
+  <span>SENTINEL v4.0 // WEBSOCKET+MSE // IMOU LIFE API</span>
 </footer>
-
 <div id="toast"></div>
 
 <script>
 let DEVICE_ID      = null;
 let currentQuality = 'HD';
-let hlsInstance    = null;
+let ws             = null;
+let mediaSource    = null;
+let sourceBuffer   = null;
+let queue          = [];
+let isAppending    = false;
 
 // ─── CLOCK ───────────────────────────────────────────────────────────────────
-function tick() {
-  document.getElementById('clock').textContent =
-    new Date().toLocaleTimeString('en-GB', { hour12: false });
-}
-setInterval(tick, 1000); tick();
 setInterval(() => {
+  const t = new Date().toLocaleTimeString('en-GB', { hour12: false });
+  document.getElementById('clock').textContent = t;
   const el = document.querySelector('.cam-ts');
-  if (el) el.textContent = new Date().toLocaleTimeString('en-GB', { hour12: false });
+  if (el) el.textContent = t;
 }, 1000);
 
 // ─── BUILD CARD ──────────────────────────────────────────────────────────────
@@ -148,6 +144,7 @@ function buildCard() {
       <div class="card-footer">
         <div class="devid">DEVICE // ${DEVICE_ID}</div>
         <div class="actions">
+          <span class="latency-badge" id="latency">--ms</span>
           <button class="icon-btn" onclick="toggleFullscreen()">FULLSCREEN</button>
           <button class="icon-btn red" onclick="stopStream()">STOP</button>
         </div>
@@ -160,16 +157,15 @@ async function loadStream() {
   setStatus('loading', 'CONNECTING...');
   showSpinner(true);
   hidePlaceholder();
-  setFooter('STARTING FFMPEG — PLEASE WAIT...');
+  setFooter('STARTING STREAM...');
 
   try {
     const res  = await fetch(`/api/stream/${DEVICE_ID}?quality=${currentQuality}`);
     const json = await res.json();
-    if (!json.success || !json.hlsUrl) throw new Error(json.error || 'No HLS URL returned');
+    if (!json.success) throw new Error(json.error || 'Failed to start stream');
 
-    console.log('[SENTINEL] HLS URL:', json.hlsUrl);
-    playHLS(json.hlsUrl);
-    setFooter(`STREAMING // HLS // ${DEVICE_ID}`);
+    connectWebSocket(json.wsUrl);
+    setFooter(`STREAMING // WebSocket+MSE // ${DEVICE_ID}`);
 
   } catch (err) {
     showSpinner(false);
@@ -181,58 +177,124 @@ async function loadStream() {
   }
 }
 
-// ─── HLS PLAYER ──────────────────────────────────────────────────────────────
-function playHLS(url) {
+// ─── WEBSOCKET + MSE PLAYER ──────────────────────────────────────────────────
+function connectWebSocket(wsPath) {
+  closeWS();
+
+  const proto  = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl  = `${proto}//${location.host}${wsPath}`;
+  console.log('[WS] Connecting to:', wsUrl);
+
+  ws = new WebSocket(wsUrl);
+  ws.binaryType = 'arraybuffer';
+
+  // Pick H.264 mime type (try high → baseline)
+  const mimeType =
+    ['video/mp4; codecs="avc1.640028"',
+     'video/mp4; codecs="avc1.42E028"',
+     'video/mp4; codecs="avc1.42001E"',
+     'video/mp4; codecs="avc1.4d001f"']
+    .find(m => MediaSource.isTypeSupported(m))
+    || 'video/mp4; codecs="avc1.42E028"';
+
+  console.log('[MSE] Using codec:', mimeType);
+
+  mediaSource = new MediaSource();
   const video = document.getElementById('cam-video');
-  destroyHLS();
+  video.src   = URL.createObjectURL(mediaSource);
 
-  if (Hls.isSupported()) {
-    hlsInstance = new Hls({
-      lowLatencyMode: true,
-      backBufferLength: 4,
-      maxBufferLength: 4,
-      maxMaxBufferLength: 8,
-      liveSyncDurationCount: 2,
-      liveMaxLatencyDurationCount: 4,
-      enableWorker: true,
-    });
+  let msOpen = false;
+  mediaSource.addEventListener('sourceopen', () => {
+    msOpen = true;
+    try {
+      sourceBuffer = mediaSource.addSourceBuffer(mimeType);
+      sourceBuffer.mode = 'segments';
+      sourceBuffer.addEventListener('updateend', drainQueue);
+      console.log('[MSE] SourceBuffer ready');
+    } catch (e) {
+      console.error('[MSE] addSourceBuffer failed:', e);
+      toast('MSE setup failed: ' + e.message, true);
+    }
+  });
 
-    hlsInstance.loadSource(url);
-    hlsInstance.attachMedia(video);
+  let frameCount = 0;
+  let connectedAt = null;
 
-    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
-      video.play().catch(e => console.warn('[SENTINEL] Autoplay blocked:', e));
+  ws.onopen = () => {
+    connectedAt = Date.now();
+    console.log('[WS] Connected');
+  };
+
+  ws.onmessage = e => {
+    if (!sourceBuffer || !msOpen) {
+      queue.push(e.data);
+      return;
+    }
+    queue.push(e.data);
+    drainQueue();
+
+    frameCount++;
+    if (frameCount === 1) {
+      // First data received — video will start playing shortly
+      video.play().catch(() => {});
+    }
+    if (frameCount === 3) {
+      // After a few chunks, assume video is playing
       showSpinner(false);
       setStatus('live', '● LIVE');
       toast('Stream connected');
-    });
+    }
+  };
 
-    hlsInstance.on(Hls.Events.ERROR, (_, data) => {
-      console.error('[SENTINEL] HLS error:', data.type, data.details, data.fatal);
-      if (data.fatal) {
-        setStatus('error', '✕ STREAM ERR');
-        showSpinner(false);
-        showPlaceholder();
-        toast('Stream error — try reconnecting', true);
+  ws.onclose = () => {
+    console.log('[WS] Closed');
+    setStatus('idle', 'DISCONNECTED');
+  };
+
+  ws.onerror = err => {
+    console.error('[WS] Error:', err);
+    setStatus('error', '✕ WS ERROR');
+    toast('WebSocket error — try reconnecting', true);
+  };
+
+  // Update latency display (browser buffered time vs current time)
+  setInterval(() => {
+    if (!video || !video.buffered.length) return;
+    const bufferedEnd = video.buffered.end(video.buffered.length - 1);
+    const latencyMs   = Math.round((bufferedEnd - video.currentTime) * 1000);
+    const el = document.getElementById('latency');
+    if (el && latencyMs > 0) el.textContent = `${latencyMs}ms`;
+
+    // If buffer grows beyond 1s, skip ahead to live edge
+    if (latencyMs > 1000) {
+      video.currentTime = bufferedEnd - 0.1;
+    }
+  }, 500);
+}
+
+function drainQueue() {
+  if (!sourceBuffer || sourceBuffer.updating || queue.length === 0) return;
+  try {
+    sourceBuffer.appendBuffer(queue.shift());
+  } catch (e) {
+    if (e.name === 'QuotaExceededError') {
+      // Remove old buffered data to make room
+      const video = document.getElementById('cam-video');
+      if (video && sourceBuffer.buffered.length) {
+        sourceBuffer.remove(0, video.currentTime - 2);
       }
-    });
-
-  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    // Safari native HLS
-    video.src = url;
-    video.addEventListener('loadedmetadata', () => {
-      video.play().catch(() => {});
-      showSpinner(false);
-      setStatus('live', '● LIVE');
-    }, { once: true });
+    }
   }
 }
 
 // ─── STOP ────────────────────────────────────────────────────────────────────
 function stopStream() {
-  destroyHLS();
+  closeWS();
   const video = document.getElementById('cam-video');
   if (video) { video.pause(); video.src = ''; }
+  mediaSource = null;
+  sourceBuffer = null;
+  queue = [];
   showPlaceholder();
   setStatus('idle', 'NO SIGNAL');
   setFooter('STREAM DISCONNECTED');
@@ -240,8 +302,8 @@ function stopStream() {
   fetch('/api/stream/stop', { method: 'POST' }).catch(() => {});
 }
 
-function destroyHLS() {
-  if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+function closeWS() {
+  if (ws) { ws.close(); ws = null; }
 }
 
 // ─── CONTROLS ────────────────────────────────────────────────────────────────
@@ -249,8 +311,7 @@ function setQuality(q) {
   currentQuality = q;
   document.getElementById('q-hd').classList.toggle('active', q === 'HD');
   document.getElementById('q-sd').classList.toggle('active', q === 'SD');
-  const video = document.getElementById('cam-video');
-  if (video && hlsInstance) loadStream();
+  if (ws) { stopStream(); setTimeout(loadStream, 300); }
 }
 
 function toggleFullscreen() {
