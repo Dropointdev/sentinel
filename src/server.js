@@ -2,118 +2,66 @@ require('dotenv').config();
 const express = require('express');
 const cors    = require('cors');
 const path    = require('path');
-const http    = require('http');
+const fs      = require('fs');
 const { request } = require('./imouclient');
-const {
-  startMediaMTX, waitForMediaMTX,
-  setMediaMTXSource, startStreamFallback,
-  waitForStream, stopStream, stopAll,
-  isRunning, WEBRTC_URL
-} = require('./ffmpegstreamer');
+const { startStream, stopStream, waitForPlaylist, OUTPUT_DIR } = require('./ffmpegstreamer');
 
 const app  = express();
 const PORT = process.env.PORT || 4000;
 
 app.use(cors());
-app.use((req, res, next) => {
-  if (req.path === '/whep') return next();
-  express.json()(req, res, next);
-});
+app.use(express.json());
 
-// Start MediaMTX immediately on boot
-startMediaMTX();
-console.log('[SERVER] MediaMTX process launched, waiting for port 9997...');
-// ─── WHEP PROXY ───────────────────────────────────────────────────────────────
-app.post('/whep', (req, res) => {
-  let body = '';
-  req.on('data', d => body += d);
-  req.on('end', () => {
-    console.log('[WHEP PROXY] Forwarding', Buffer.byteLength(body), 'bytes to MediaMTX');
-    
-    const options = {
-      hostname: '127.0.0.1',
-      port: 8889,
-      path: '/cam/whep',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/sdp',
-        'Content-Length': Buffer.byteLength(body)
-      }
-    };
+// Serve HLS segments — no caching
+app.use('/streams', express.static(path.join(__dirname, '..', 'streams'), {
+  maxAge: 0,
+  setHeaders: res => {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  }
+}));
 
-    const proxy = http.request(options, proxyRes => {
-      console.log('[WHEP PROXY] MediaMTX responded:', proxyRes.statusCode);
-      res.status(proxyRes.statusCode);
-      Object.entries(proxyRes.headers).forEach(([k, v]) => res.setHeader(k, v));
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      proxyRes.pipe(res);
-    });
-
-    proxy.on('error', err => {
-      console.error('[WHEP PROXY] Cannot reach MediaMTX:', err.message);
-      res.status(502).json({ error: 'MediaMTX not reachable: ' + err.message });
-    });
-
-    proxy.write(body);
-    proxy.end();
-  });
-});
-
-// Handle preflight
-app.options('/whep', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.sendStatus(204);
-});
-
-// ─── GET STREAM ───────────────────────────────────────────────────────────────
+// ─── START STREAM ─────────────────────────────────────────────────────────────
 app.get('/api/stream/:deviceId', async (req, res) => {
   const { deviceId } = req.params;
-  const wantSD   = req.query.quality === 'SD';
-  const streamId = wantSD ? 1 : 0;
+  const wantSD       = req.query.quality === 'SD';
+  const playlistPath = path.join(OUTPUT_DIR, deviceId, 'index.m3u8');
 
   try {
-    await waitForMediaMTX();
-
-    // Unbind any existing session
+    // Unbind old IMOU session
     try {
-      const liveInfo = await request('getLiveStreamInfo', { deviceId, channelId: '0' });
-      const liveToken = (liveInfo.streams || [])[0]?.liveToken;
-      if (liveToken) {
-        await request('unbindLive', { liveToken });
-        console.log('[STREAM] Unbound old session');
-      }
-    } catch (e) { console.log('[STREAM] Unbind skipped:', e.message); }
+      const info     = await request('getLiveStreamInfo', { deviceId, channelId: '0' });
+      const liveToken = (info.streams || [])[0]?.liveToken;
+      if (liveToken) { await request('unbindLive', { liveToken }); console.log('[STREAM] Unbound old session'); }
+    } catch (_) {}
 
     // Bind fresh session
-    const bindData = await request('bindDeviceLive', { deviceId, channelId: '0', streamId });
-    const streams  = bindData.streams || [];
-    if (!streams.length) return res.status(502).json({ error: 'No streams in bind response', raw: bindData });
+    await request('bindDeviceLive', { deviceId, channelId: '0', streamId: wantSD ? 1 : 0 });
 
-    const chosen = streams.find(s => s.hls || s.rtsp) || streams[0];
-    console.log('[STREAM] Available URLs:', JSON.stringify({
-      rtsp: chosen.rtsp ? chosen.rtsp.substring(0, 60) + '...' : 'none',
-      hls:  chosen.hls  ? chosen.hls.substring(0, 60)  + '...' : 'none',
-    }));
+    // Get stream URLs
+    const data    = await request('getLiveStreamInfo', { deviceId, channelId: '0' });
+    const streams = data.streams || [];
+    if (!streams.length) return res.status(502).json({ error: 'No streams returned' });
 
-    // ── PATH 1: RTSP direct → MediaMTX (zero transcode, ~100-200ms latency) ──
-    if (chosen.rtsp) {
-      console.log('[STREAM] Using RTSP direct path — no FFmpeg, no transcode');
-      await setMediaMTXSource(chosen.rtsp);
-      await waitForStream(15000);
-      return res.json({ success: true, webrtcUrl: '/whep' });
-    }
+    // Prefer HTTP stream (port 8888) — more reliable for FFmpeg than HTTPS 8890
+    const targetId = wantSD ? 1 : 0;
+    const chosen   =
+      streams.find(s => s.hls?.startsWith('http:') && s.streamId === targetId) ||
+      streams.find(s => s.streamId === targetId) ||
+      streams[0];
 
-    // ── PATH 2: HLS → FFmpeg remux (video copy, audio→opus) → MediaMTX ──────
-    if (chosen.hls) {
-      console.log('[STREAM] RTSP not available, falling back to HLS copy remux');
-      startStreamFallback(chosen.hls);
-      await waitForStream(15000);
-      return res.json({ success: true, webrtcUrl: '/whep' });
-    }
+    if (!chosen?.hls) return res.status(502).json({ error: 'No HLS URL in response' });
 
-    return res.status(502).json({ error: 'No usable stream URL', streams });
+    console.log('[STREAM] Starting:', chosen.hls.substring(0, 80));
+
+    // Start FFmpeg: HEVC → H.264 → HLS files on disk
+    startStream(chosen.hls, deviceId);
+
+    // Wait until FFmpeg has written real segments (up to 25s)
+    await waitForPlaylist(playlistPath, 25000);
+    console.log('[STREAM] Segments ready');
+
+    res.json({ success: true, hlsUrl: `/streams/${deviceId}/index.m3u8` });
 
   } catch (err) {
     console.error('[STREAM ERROR]:', err.message);
@@ -140,17 +88,16 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', deviceId: process.env.IMOU_DEVICE_ID, time: new Date().toISOString() });
 });
 
-// ─── FRONTEND ────────────────────────────────────────────────────────────────
+// ─── FRONTEND ─────────────────────────────────────────────────────────────────
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
 });
 
-// Cleanup on exit
-process.on('SIGINT',  () => { stopAll(); process.exit(); });
-process.on('SIGTERM', () => { stopAll(); process.exit(); });
+process.on('SIGINT',  () => { stopStream(); process.exit(); });
+process.on('SIGTERM', () => { stopStream(); process.exit(); });
 
 app.listen(PORT, () => {
   console.log(`\n🟢 SENTINEL running at http://localhost:${PORT}`);
   console.log(`   Device : ${process.env.IMOU_DEVICE_ID}`);
-  console.log(`   WebRTC : proxied via /whep\n`);
+  console.log(`   Mode   : HLS (H.264 via FFmpeg)\n`);
 });

@@ -1,215 +1,115 @@
 const { spawn } = require('child_process');
 const path = require('path');
-const http = require('http');
-const net  = require('net');
+const fs   = require('fs');
 
-let mediamtxProcess = null;
-let ffmpegProcess   = null;
+let ffmpegProcess = null;
+const OUTPUT_DIR  = process.env.STREAMS_DIR || path.join(__dirname, '..', 'streams');
 
-// Replace the MEDIAMTX_PATH line with:
-const MEDIAMTX_BIN  = process.platform === 'win32' ? 'mediamtx.exe' : 'mediamtx';
-const MEDIAMTX_PATH = path.join(__dirname, '..', MEDIAMTX_BIN);
-const MEDIAMTX_CONF = path.join(__dirname, '..', 'mediamtx.yml');
-const WEBRTC_URL    = 'http://localhost:8889/cam/whep';
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
 
-// ─── START MEDIAMTX ──────────────────────────────────────────────────────────
-function startMediaMTX() {
-  if (mediamtxProcess) return;
-  console.log('[MEDIAMTX] Starting...');
-  mediamtxProcess = spawn(MEDIAMTX_PATH, [MEDIAMTX_CONF], {
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-  mediamtxProcess.stdout.on('data', d => console.log('[MEDIAMTX]', d.toString().trim()));
-  mediamtxProcess.stderr.on('data', d => console.log('[MEDIAMTX]', d.toString().trim()));
-  mediamtxProcess.on('close', code => {
-    console.log('[MEDIAMTX] exited with code', code);
-    mediamtxProcess = null;
+function clearDir(dir) {
+  if (!fs.existsSync(dir)) return;
+  fs.readdirSync(dir).forEach(f => {
+    if (f.endsWith('.ts') || f.endsWith('.m3u8') || f.endsWith('.tmp'))
+      try { fs.unlinkSync(path.join(dir, f)); } catch (_) {}
   });
 }
 
-// ─── WAIT FOR MEDIAMTX API PORT ──────────────────────────────────────────────
-function waitForMediaMTX(timeoutMs = 10000) {
+function waitForPlaylist(playlistPath, timeoutMs = 25000) {
   return new Promise((resolve, reject) => {
     const start = Date.now();
-    const check = () => {
-      const client = new net.Socket();
-      client.setTimeout(500);
-      client.connect(9997, '127.0.0.1', () => { client.destroy(); resolve(); });
-      client.on('error', () => {
-        client.destroy();
-        if (Date.now() - start > timeoutMs) return reject(new Error('MediaMTX did not start in time'));
-        setTimeout(check, 400);
-      });
-      client.on('timeout', () => {
-        client.destroy();
-        if (Date.now() - start > timeoutMs) return reject(new Error('MediaMTX timeout'));
-        setTimeout(check, 400);
-      });
-    };
-    check();
-  });
-}
-
-// ─── SET MEDIAMTX SOURCE DIRECTLY (no FFmpeg) ────────────────────────────────
-// MediaMTX pulls RTSP from IMOU and serves as WebRTC — zero transcode latency
-function setMediaMTXSource(rtspUrl) {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({
-      source: rtspUrl,
-      sourceProtocol: 'tcp',
-      sourceAnyPortEnable: true,
-    });
-
-    const req = http.request({
-      hostname: '127.0.0.1',
-      port: 9997,
-      path: '/v3/config/paths/patch/cam',
-      method: 'PATCH',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body)
-      }
-    }, res => {
-      let data = '';
-      res.on('data', d => data += d);
-      res.on('end', () => {
-        if (res.statusCode === 200) {
-          console.log('[MEDIAMTX] Source set to RTSP — zero transcode path active');
-          resolve();
-        } else {
-          reject(new Error(`MediaMTX API returned ${res.statusCode}: ${data}`));
+    const check = setInterval(() => {
+      try {
+        if (fs.existsSync(playlistPath)) {
+          const txt = fs.readFileSync(playlistPath, 'utf8');
+          if (txt.includes('#EXTINF')) { clearInterval(check); return resolve(); }
         }
-      });
-    });
-
-    req.on('error', reject);
-    req.write(body);
-    req.end();
+      } catch (_) {}
+      if (Date.now() - start > timeoutMs) {
+        clearInterval(check);
+        reject(new Error('Timed out waiting for video segments — FFmpeg may have failed'));
+      }
+    }, 400);
   });
 }
 
-// ─── FFMPEG FALLBACK (used only if no RTSP URL from IMOU) ────────────────────
-// Stream copy only — no transcode, just remux HLS segments into RTSP
-function startStreamFallback(inputUrl) {
+function isRunning() { return ffmpegProcess !== null; }
+
+function startStream(inputUrl, deviceId = 'cam') {
+  // Kill any existing process
   if (ffmpegProcess) {
-    console.log('[FFMPEG] Already running');
-    return;
+    ffmpegProcess.kill('SIGTERM');
+    ffmpegProcess = null;
   }
 
-  console.log('[FFMPEG] Fallback remux HLS→RTSP (video copy, audio→opus):', inputUrl);
+  const outDir     = path.join(OUTPUT_DIR, deviceId);
+  const outPlaylist = path.join(outDir, 'index.m3u8');
+
+  ensureDir(outDir);
+  clearDir(outDir);
+
+  console.log('[FFMPEG] Starting transcode for:', deviceId);
+  console.log('[FFMPEG] Input:', inputUrl);
 
   const args = [
-  '-allowed_extensions', 'ALL',
-  '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
-  '-probesize', '500000',
-  '-analyzeduration', '500000',
-  '-fflags', 'nobuffer+discardcorrupt+flush_packets',
-  '-flags', 'low_delay',
-  '-avoid_negative_ts', 'make_zero',
-  '-use_wallclock_as_timestamps', '1',
-  '-i', inputUrl,
+    // Input
+    '-allowed_extensions', 'ALL',
+    '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
+    '-fflags', 'nobuffer+discardcorrupt',
+    '-flags', 'low_delay',
+    '-probesize', '500000',
+    '-analyzeduration', '500000',
+    '-i', inputUrl,
 
-  '-map', '0:v:0',
-  '-map', '0:a:0',
+    // HEVC → H.264 (camera outputs HEVC, browsers need H.264)
+    '-c:v', 'libx264',
+    '-preset', 'ultrafast',
+    '-tune', 'zerolatency',
+    '-crf', '28',
+    '-vf', 'scale=1280:-2',   // downscale from 2688 to 1280 wide
+    '-an',                     // drop audio (IMOU audio causes issues)
 
-  '-c:v', 'copy',
-  '-c:a', 'libopus',
-  '-b:a', '32k',
-  '-ar', '16000',  // IMOU native rate — no resampling needed
-  '-ac', '1',
-  '-application', 'lowdelay',
-  '-af', 'aresample=async=1:min_hard_comp=0.100000:first_pts=0',
+    // Low-latency keyframes (1 per second at 20fps)
+    '-g', '20',
+    '-keyint_min', '20',
+    '-sc_threshold', '0',
 
-  '-f', 'rtsp',
-  '-rtsp_transport', 'tcp',
-  'rtsp://localhost:8554/cam'
-];
+    // HLS output — 1s segments for low latency
+    '-f', 'hls',
+    '-hls_time', '1',
+    '-hls_list_size', '3',
+    '-hls_flags', 'delete_segments+append_list+omit_endlist+split_by_time',
+    '-hls_segment_type', 'mpegts',
+    '-hls_segment_filename', path.join(outDir, 'seg%d.ts'),
+    outPlaylist,
+  ];
 
   ffmpegProcess = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
   ffmpegProcess.stdout.on('data', d => process.stdout.write('[FFMPEG] ' + d));
   ffmpegProcess.stderr.on('data', d => {
     const msg = d.toString();
-    if (/error|Error|Stream #|Input #|Output #|Video:|Audio:|fps|speed/i.test(msg)) {
-      console.log('[FFMPEG]', msg.trim());
+    // Log useful lines, skip per-frame noise
+    if (/Error|error|Opening.*writing|Input #|Stream #|hevc|h264/i.test(msg) && !/frame=/.test(msg)) {
+      console.log('[FFMPEG]', msg.trim().split('\n')[0]);
     }
   });
+
   ffmpegProcess.on('close', code => {
-    console.log('[FFMPEG] exited with code', code);
+    console.log('[FFMPEG] exited, code:', code);
     ffmpegProcess = null;
   });
-}
 
-// ─── WAIT FOR VIDEO TRACK IN MEDIAMTX ────────────────────────────────────────
-function waitForStream(timeoutMs = 15000) {
-  return new Promise((resolve, reject) => {
-    const start = Date.now();
-    const check = () => {
-      const req = http.get('http://localhost:9997/v3/paths/list', res => {
-        let body = '';
-        res.on('data', d => body += d);
-        res.on('end', () => {
-          try {
-            const json = JSON.parse(body);
-            const cam  = (json.items || []).find(p => p.name === 'cam');
-            // H264, H265, HEVC — all supported by Chrome/Edge WebRTC
-            if (cam && cam.tracks && cam.tracks.some(t => /H264|H265|HEVC/i.test(t))) {
-              console.log('[STREAM] Tracks ready:', cam.tracks);
-              return resolve();
-            }
-          } catch {}
-          if (Date.now() - start > timeoutMs) return reject(new Error('Stream not ready in time'));
-          setTimeout(check, 500);
-        });
-      });
-      req.on('error', () => {
-        if (Date.now() - start > timeoutMs) return reject(new Error('MediaMTX API not responding'));
-        setTimeout(check, 500);
-      });
-    };
-    check();
-  });
+  return outPlaylist;
 }
-
-// ─── STOP ────────────────────────────────────────────────────────────────────
-function isRunning() { return ffmpegProcess !== null; }
 
 function stopStream() {
-  if (ffmpegProcess) {
-    console.log('[FFMPEG] Stopping');
-    ffmpegProcess.kill('SIGTERM');
-    ffmpegProcess = null;
-  }
-  // Reset MediaMTX path back to passive publisher mode
-  const body = JSON.stringify({ source: 'publisher' });
-  const req = http.request({
-    hostname: '127.0.0.1', port: 9997,
-    path: '/v3/config/paths/patch/cam', method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
-  });
-  req.on('error', () => {});
-  req.write(body);
-  req.end();
+  if (!ffmpegProcess) return;
+  console.log('[FFMPEG] Stopping');
+  ffmpegProcess.kill('SIGTERM');
+  ffmpegProcess = null;
 }
 
-function stopAll() {
-  stopStream();
-  if (mediamtxProcess) {
-    console.log('[MEDIAMTX] Stopping');
-    mediamtxProcess.kill('SIGTERM');
-    mediamtxProcess = null;
-  }
-}
-
-// ─── EXPORTS ─────────────────────────────────────────────────────────────────
-module.exports = {
-  startMediaMTX,
-  waitForMediaMTX,
-  setMediaMTXSource,
-  startStreamFallback,
-  waitForStream,
-  stopStream,
-  stopAll,
-  isRunning,
-  WEBRTC_URL
-};
+module.exports = { startStream, stopStream, waitForPlaylist, isRunning, OUTPUT_DIR };

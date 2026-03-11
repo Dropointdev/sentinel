@@ -6,6 +6,7 @@
   <title>SENTINEL — Live Monitor</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow+Condensed:wght@300;400;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.4.12/hls.min.js"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -16,7 +17,7 @@
     html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--sans);overflow-x:hidden}
     body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,.04) 2px,rgba(0,0,0,.04) 4px);pointer-events:none;z-index:9999}
     header{display:flex;align-items:center;justify-content:space-between;padding:14px 28px;border-bottom:1px solid var(--border);background:var(--surface);position:sticky;top:0;z-index:100}
-    .logo{font-family:var(--sans);font-weight:700;font-size:22px;letter-spacing:6px;color:var(--accent)}
+    .logo{font-weight:700;font-size:22px;letter-spacing:6px;color:var(--accent)}
     .logo span{color:var(--text);font-weight:300}
     .header-meta{display:flex;align-items:center;gap:24px}
     .live-badge{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;color:var(--green);letter-spacing:2px}
@@ -33,7 +34,7 @@
     .btn.danger:hover{background:var(--red);color:#fff}
     .btn.active{background:var(--accent);color:var(--bg);border-color:var(--accent)}
     .spacer{margin-left:auto}
-    .quality-toggle{display:flex;gap:0}
+    .quality-toggle{display:flex}
     .quality-toggle .btn{padding:7px 12px}
     .quality-toggle .btn:first-child{border-right:none}
     main{padding:20px 28px;display:flex;flex-direction:column;gap:16px}
@@ -98,7 +99,7 @@
 
 <footer>
   <span id="footer-msg">AWAITING CONNECTION</span>
-  <span>SENTINEL v2.0 // WEBRTC // IMOU LIFE API</span>
+  <span>SENTINEL v3.0 // HLS // IMOU LIFE API</span>
 </footer>
 
 <div id="toast"></div>
@@ -106,7 +107,7 @@
 <script>
 let DEVICE_ID      = null;
 let currentQuality = 'HD';
-let peerConnection = null;
+let hlsInstance    = null;
 
 // ─── CLOCK ───────────────────────────────────────────────────────────────────
 function tick() {
@@ -147,7 +148,6 @@ function buildCard() {
       <div class="card-footer">
         <div class="devid">DEVICE // ${DEVICE_ID}</div>
         <div class="actions">
-          <button class="icon-btn" id="mute-btn" onclick="toggleMute()">MUTE</button>
           <button class="icon-btn" onclick="toggleFullscreen()">FULLSCREEN</button>
           <button class="icon-btn red" onclick="stopStream()">STOP</button>
         </div>
@@ -160,25 +160,16 @@ async function loadStream() {
   setStatus('loading', 'CONNECTING...');
   showSpinner(true);
   hidePlaceholder();
-  setFooter('FETCHING STREAM URL...');
+  setFooter('STARTING FFMPEG — PLEASE WAIT...');
 
   try {
     const res  = await fetch(`/api/stream/${DEVICE_ID}?quality=${currentQuality}`);
     const json = await res.json();
-    if (!json.success || !json.webrtcUrl) throw new Error(json.error || 'No WebRTC URL returned');
+    if (!json.success || !json.hlsUrl) throw new Error(json.error || 'No HLS URL returned');
 
-    console.log('[SENTINEL] WHEP URL:', json.webrtcUrl);
-    await playWebRTC(json.webrtcUrl);
-
-    // Unmute after user gesture
-    const video = document.getElementById('cam-video');
-    if (video) {
-      video.muted = false;
-      const btn = document.getElementById('mute-btn');
-      if (btn) btn.textContent = 'MUTE';
-    }
-
-    setFooter(`STREAMING // WebRTC // ${DEVICE_ID}`);
+    console.log('[SENTINEL] HLS URL:', json.hlsUrl);
+    playHLS(json.hlsUrl);
+    setFooter(`STREAMING // HLS // ${DEVICE_ID}`);
 
   } catch (err) {
     showSpinner(false);
@@ -190,69 +181,58 @@ async function loadStream() {
   }
 }
 
-// ─── WEBRTC PLAYER ───────────────────────────────────────────────────────────
-async function playWebRTC(url) {
+// ─── HLS PLAYER ──────────────────────────────────────────────────────────────
+function playHLS(url) {
   const video = document.getElementById('cam-video');
-  closePeerConnection();
+  destroyHLS();
 
-  peerConnection = new RTCPeerConnection({
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      {
-        urls: 'turn:openrelay.metered.ca:80',
-        username: 'openrelayproject',
-        credential: 'openrelayproject'
-      }
-    ]
-  });
+  if (Hls.isSupported()) {
+    hlsInstance = new Hls({
+      lowLatencyMode: true,
+      backBufferLength: 4,
+      maxBufferLength: 4,
+      maxMaxBufferLength: 8,
+      liveSyncDurationCount: 2,
+      liveMaxLatencyDurationCount: 4,
+      enableWorker: true,
+    });
 
-  peerConnection.addTransceiver('video', { direction: 'recvonly' });
-  peerConnection.addTransceiver('audio', { direction: 'recvonly' });
+    hlsInstance.loadSource(url);
+    hlsInstance.attachMedia(video);
 
-  peerConnection.ontrack = e => {
-    console.log('[WebRTC] Track received:', e.track.kind);
-    if (e.track.kind === 'video') {
-      video.srcObject = e.streams[0];
-      video.play().catch(err => console.warn('[SENTINEL] Autoplay blocked:', err));
+    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+      video.play().catch(e => console.warn('[SENTINEL] Autoplay blocked:', e));
       showSpinner(false);
       setStatus('live', '● LIVE');
       toast('Stream connected');
-    }
-  };
+    });
 
-  peerConnection.oniceconnectionstatechange = () => {
-    const state = peerConnection.iceConnectionState;
-    console.log('[WebRTC] ICE state:', state);
-    if (state === 'failed' || state === 'disconnected') {
-      setStatus('error', '✕ DISCONNECTED');
-      toast('WebRTC disconnected — try reconnecting', true);
-    }
-  };
+    hlsInstance.on(Hls.Events.ERROR, (_, data) => {
+      console.error('[SENTINEL] HLS error:', data.type, data.details, data.fatal);
+      if (data.fatal) {
+        setStatus('error', '✕ STREAM ERR');
+        showSpinner(false);
+        showPlaceholder();
+        toast('Stream error — try reconnecting', true);
+      }
+    });
 
-  const offer = await peerConnection.createOffer();
-  await peerConnection.setLocalDescription(offer);
-
-  // Convert relative URL → absolute so fetch works on both localhost and Render
-  const whepUrl = url.startsWith('http') ? url : `${window.location.origin}${url}`;
-  console.log('[SENTINEL] Sending WHEP offer to:', whepUrl);
-
-  const response = await fetch(whepUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/sdp' },
-    body: offer.sdp
-  });
-
-  if (!response.ok) throw new Error(`WHEP handshake failed: HTTP ${response.status}`);
-
-  const answerSdp = await response.text();
-  await peerConnection.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    // Safari native HLS
+    video.src = url;
+    video.addEventListener('loadedmetadata', () => {
+      video.play().catch(() => {});
+      showSpinner(false);
+      setStatus('live', '● LIVE');
+    }, { once: true });
+  }
 }
 
 // ─── STOP ────────────────────────────────────────────────────────────────────
 function stopStream() {
-  closePeerConnection();
+  destroyHLS();
   const video = document.getElementById('cam-video');
-  if (video) { video.pause(); video.srcObject = null; }
+  if (video) { video.pause(); video.src = ''; }
   showPlaceholder();
   setStatus('idle', 'NO SIGNAL');
   setFooter('STREAM DISCONNECTED');
@@ -260,8 +240,8 @@ function stopStream() {
   fetch('/api/stream/stop', { method: 'POST' }).catch(() => {});
 }
 
-function closePeerConnection() {
-  if (peerConnection) { peerConnection.close(); peerConnection = null; }
+function destroyHLS() {
+  if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
 }
 
 // ─── CONTROLS ────────────────────────────────────────────────────────────────
@@ -269,15 +249,8 @@ function setQuality(q) {
   currentQuality = q;
   document.getElementById('q-hd').classList.toggle('active', q === 'HD');
   document.getElementById('q-sd').classList.toggle('active', q === 'SD');
-  if (peerConnection) { stopStream(); setTimeout(loadStream, 500); }
-}
-
-function toggleMute() {
   const video = document.getElementById('cam-video');
-  const btn   = document.getElementById('mute-btn');
-  if (!video || !btn) return;
-  video.muted = !video.muted;
-  btn.textContent = video.muted ? 'UNMUTE' : 'MUTE';
+  if (video && hlsInstance) loadStream();
 }
 
 function toggleFullscreen() {
@@ -304,9 +277,7 @@ function hidePlaceholder() {
   const el = document.getElementById('placeholder');
   if (el) el.style.display = 'none';
 }
-function setFooter(msg) {
-  document.getElementById('footer-msg').textContent = msg;
-}
+function setFooter(msg) { document.getElementById('footer-msg').textContent = msg; }
 function toast(msg, isErr = false) {
   const t = document.getElementById('toast');
   t.textContent = msg;
@@ -324,17 +295,13 @@ fetch('/api/health')
   })
   .then(r => r.json())
   .then(d => {
-    if (d.online) {
-      setFooter('DEVICE ONLINE — READY TO STREAM');
-      toast('Device online');
-    } else {
-      setFooter('DEVICE OFFLINE');
-      toast('Device appears offline', true);
-    }
+    setFooter(d.online ? 'DEVICE ONLINE — READY TO STREAM' : 'DEVICE OFFLINE');
+    if (d.online) toast('Device online');
+    else toast('Device appears offline', true);
   })
   .catch(err => {
     console.error('Init error:', err);
-    setFooter('INIT FAILED — check server');
+    setFooter('INIT FAILED — check server logs');
   });
 </script>
 </body>

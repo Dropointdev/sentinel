@@ -1,7 +1,7 @@
 {
-  "name": "sentinel-live-monitor",
-  "version": "1.0.0",
-  "description": "IMOU camera live stream monitor",
+  "name": "sentinel",
+  "version": "3.0.0",
+  "description": "IMOU camera live stream monitor — HLS via FFmpeg",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
@@ -15,5 +15,6 @@
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
-  }
+  },
+  "engines": { "node": ">=18" }
 }
