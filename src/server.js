@@ -22,12 +22,14 @@ app.use((req, res, next) => {
 
 // Start MediaMTX immediately on boot
 startMediaMTX();
-
+console.log('[SERVER] MediaMTX process launched, waiting for port 9997...');
 // ─── WHEP PROXY ───────────────────────────────────────────────────────────────
 app.post('/whep', (req, res) => {
   let body = '';
   req.on('data', d => body += d);
   req.on('end', () => {
+    console.log('[WHEP PROXY] Forwarding', Buffer.byteLength(body), 'bytes to MediaMTX');
+    
     const options = {
       hostname: '127.0.0.1',
       port: 8889,
@@ -40,16 +42,15 @@ app.post('/whep', (req, res) => {
     };
 
     const proxy = http.request(options, proxyRes => {
+      console.log('[WHEP PROXY] MediaMTX responded:', proxyRes.statusCode);
       res.status(proxyRes.statusCode);
-      // Forward all headers from MediaMTX
       Object.entries(proxyRes.headers).forEach(([k, v]) => res.setHeader(k, v));
-      // Add CORS
       res.setHeader('Access-Control-Allow-Origin', '*');
       proxyRes.pipe(res);
     });
 
     proxy.on('error', err => {
-      console.error('[WHEP PROXY] Error:', err.message);
+      console.error('[WHEP PROXY] Cannot reach MediaMTX:', err.message);
       res.status(502).json({ error: 'MediaMTX not reachable: ' + err.message });
     });
 

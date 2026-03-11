@@ -10,12 +10,6 @@ srtAddress: :8890
 api: yes
 apiAddress: :9997
 
-# Force ICE TCP — required behind Render's network/proxy
-webrtcICEHostNetworkInterfaceFilter: ""
-webrtcICETCPAddress: :8889
-webrtcICEServers2:
-  - url: stun:stun.l.google.com:19302
-
 paths:
   cam:
     source: publisher
