@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors    = require('cors');
 const path    = require('path');
+const http    = require('http');
 const { request } = require('./imouclient');
 const {
   startMediaMTX, waitForMediaMTX,
@@ -18,6 +19,39 @@ app.use(express.json());
 
 // Start MediaMTX immediately on boot
 startMediaMTX();
+
+// ─── WHEP PROXY ───────────────────────────────────────────────────────────────
+// Browser can't reach localhost:8889 on Render — proxy through Express instead
+app.post('/whep', (req, res) => {
+  let body = '';
+  req.on('data', d => body += d);
+  req.on('end', () => {
+    const options = {
+      hostname: '127.0.0.1',
+      port: 8889,
+      path: '/cam/whep',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/sdp',
+        'Content-Length': Buffer.byteLength(body)
+      }
+    };
+
+    const proxy = http.request(options, proxyRes => {
+      res.status(proxyRes.statusCode);
+      Object.entries(proxyRes.headers).forEach(([k, v]) => res.setHeader(k, v));
+      proxyRes.pipe(res);
+    });
+
+    proxy.on('error', err => {
+      console.error('[WHEP PROXY] Error:', err.message);
+      res.status(502).json({ error: 'MediaMTX not reachable' });
+    });
+
+    proxy.write(body);
+    proxy.end();
+  });
+});
 
 // ─── GET STREAM ───────────────────────────────────────────────────────────────
 app.get('/api/stream/:deviceId', async (req, res) => {
@@ -54,15 +88,15 @@ app.get('/api/stream/:deviceId', async (req, res) => {
       console.log('[STREAM] Using RTSP direct path — no FFmpeg, no transcode');
       await setMediaMTXSource(chosen.rtsp);
       await waitForStream(15000);
-      return res.json({ success: true, webrtcUrl: WEBRTC_URL });
+      return res.json({ success: true, webrtcUrl: '/whep' });
     }
 
-    // ── PATH 2: HLS → FFmpeg remux (copy, no transcode) → MediaMTX ──────────
+    // ── PATH 2: HLS → FFmpeg remux (video copy, audio→opus) → MediaMTX ──────
     if (chosen.hls) {
       console.log('[STREAM] RTSP not available, falling back to HLS copy remux');
       startStreamFallback(chosen.hls);
       await waitForStream(15000);
-      return res.json({ success: true, webrtcUrl: WEBRTC_URL });
+      return res.json({ success: true, webrtcUrl: '/whep' });
     }
 
     return res.status(502).json({ error: 'No usable stream URL', streams });
@@ -104,5 +138,5 @@ process.on('SIGTERM', () => { stopAll(); process.exit(); });
 app.listen(PORT, () => {
   console.log(`\n🟢 SENTINEL running at http://localhost:${PORT}`);
   console.log(`   Device : ${process.env.IMOU_DEVICE_ID}`);
-  console.log(`   WebRTC : http://localhost:8889/cam/whep\n`);
+  console.log(`   WebRTC : proxied via /whep\n`);
 });
