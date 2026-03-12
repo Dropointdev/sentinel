@@ -2,7 +2,9 @@ const axios  = require('axios');
 const crypto = require('crypto');
 
 const BASE_URL = 'https://openapi.easy4ip.com/openapi';
-let _token = null, _expiry = 0;
+let _token    = null;
+let _expiry   = 0;
+let _fetching = null;   // in-flight promise — shared by concurrent callers
 
 function buildBody(api, params) {
   const timestamp = Math.floor(Date.now() / 1000);
@@ -26,23 +28,31 @@ async function callApi(api, params = {}) {
 
 async function getToken(forceRefresh = false) {
   if (!forceRefresh && _token && Date.now() / 1000 < _expiry - 60) return _token;
-  const data = await callApi('accessToken', {});
-  _token  = data.accessToken;
-  _expiry = data.expireTime;
-  console.log('[IMOU] Token refreshed');
-  return _token;
+
+  // If another call is already fetching a token, wait for that instead of making a new request
+  if (_fetching) return _fetching;
+
+  _fetching = callApi('accessToken', {}).then(data => {
+    _token    = data.accessToken;
+    _expiry   = data.expireTime;
+    _fetching = null;
+    console.log('[IMOU] Token refreshed');
+    return _token;
+  }).catch(err => {
+    _fetching = null;
+    throw err;
+  });
+
+  return _fetching;
 }
 
 async function request(api, params = {}) {
-  // First attempt with cached token
   try {
     return await callApi(api, { ...params, token: await getToken() });
   } catch (err) {
-    // OP1009 = token invalidated server-side (e.g. after camera reboot)
-    // Force a fresh token and retry once
     if (err.message.includes('OP1009')) {
       console.log('[IMOU] OP1009 — forcing token refresh and retrying');
-      _token = null; _expiry = 0;
+      _token = null; _expiry = 0; _fetching = null;
       return await callApi(api, { ...params, token: await getToken(true) });
     }
     throw err;

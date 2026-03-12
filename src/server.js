@@ -8,8 +8,11 @@ const { WebSocketServer } = require('ws');
 const { request } = require('./imouclient');
 const { startStream, stopStream, getInitSegment, isRunning, bus } = require('./ffmpegstreamer');
 
-let _streamLock = false;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+let _streamLock    = false;
+let _activeDevice  = null;   // currently streaming device
+let _activeQuality = 0;      // 0=HD 1=SD
+let _reconnecting  = false;
 
 const app    = express();
 const server = http.createServer(app);
@@ -46,23 +49,20 @@ function drain(ws) {
 bus.on('init', chunk => { for (const ws of wss.clients) sendToClient(ws, chunk); });
 bus.on('data', chunk => { for (const ws of wss.clients) sendToClient(ws, chunk); });
 
-// ── IMOU session helpers ──────────────────────────────────────────────────────
-
-// Unbind the ONE active session IMOU tracks — getLiveStreamInfo returns it
+// ── IMOU helpers ──────────────────────────────────────────────────────────────
 async function unbindCurrent(deviceId) {
   try {
     const info = await request('getLiveStreamInfo', { deviceId, channelId: '0' });
     const tok  = (info.streams || [])[0]?.liveToken;
     if (tok) {
       await request('unbindLive', { liveToken: tok });
-      console.log('[IMOU] Unbound session:', tok.slice(0, 16) + '...');
+      console.log('[IMOU] Unbound session');
       return true;
     }
   } catch (_) {}
   return false;
 }
 
-// Fetch playlist and return { ok, body }
 async function fetchPlaylist(url) {
   try {
     const r    = await axios.get(url, { timeout: 6000 });
@@ -73,53 +73,116 @@ async function fetchPlaylist(url) {
   }
 }
 
+// Bind IMOU session and return the HLS URL
+async function bindAndGetUrl(deviceId, streamId) {
+  await request('bindDeviceLive', { deviceId, channelId: '0', streamId });
+  await sleep(1000);
+  const info    = await request('getLiveStreamInfo', { deviceId, channelId: '0' });
+  const streams = info.streams || [];
+  if (!streams.length) throw new Error('No streams from IMOU');
+  const chosen =
+    streams.find(s => s.hls?.startsWith('http:') && s.streamId === streamId) ||
+    streams.find(s => s.streamId === streamId) || streams[0];
+  if (!chosen?.hls) throw new Error('No HLS URL');
+  return chosen;
+}
+
+// ── Auto-restart when FFmpeg dies ─────────────────────────────────────────────
+bus.on('end', async () => {
+  if (!_activeDevice || _reconnecting || wss.clients.size === 0) {
+    // No active device, already reconnecting, or no viewers — just clean up
+    if (_activeDevice) await unbindCurrent(_activeDevice).catch(() => {});
+    return;
+  }
+
+  _reconnecting = true;
+  console.log('[RECOVER] FFmpeg ended — auto-restarting in 2s');
+
+  // Notify clients stream is briefly interrupted (they keep WS open)
+  for (const ws of wss.clients) {
+    if (ws.readyState === ws.OPEN)
+      try { ws.send(JSON.stringify({ type: 'reconnecting' })); } catch (_) {}
+  }
+
+  await sleep(2000);
+
+  try {
+    await unbindCurrent(_activeDevice);
+    await sleep(2000);
+
+    const chosen = await bindAndGetUrl(_activeDevice, _activeQuality);
+    const { ok, body } = await fetchPlaylist(chosen.hls);
+    if (!ok) throw new Error('Playlist not ready: ' + body.substring(0, 100));
+
+    console.log('[RECOVER] Got fresh URL, restarting FFmpeg');
+    await startStream(chosen.hls);
+
+    // Wait for new init segment and send to all connected clients
+    await new Promise((resolve, reject) => {
+      if (getInitSegment()) return resolve();
+      const t     = setTimeout(() => reject(new Error('init timeout')), 20000);
+      const onEnd = () => { clearTimeout(t); reject(new Error('FFmpeg exited again')); };
+      bus.once('init', () => { clearTimeout(t); bus.removeListener('end', onEnd); resolve(); });
+      bus.once('end', onEnd);
+    });
+
+    // Send fresh init segment to all connected clients so MSE resets codec
+    const init = getInitSegment();
+    if (init) {
+      for (const ws of wss.clients) {
+        if (ws.readyState === ws.OPEN)
+          try { ws.send(init, { binary: true }); } catch (_) {}
+      }
+    }
+
+    // Notify clients stream is back
+    for (const ws of wss.clients) {
+      if (ws.readyState === ws.OPEN)
+        try { ws.send(JSON.stringify({ type: 'reconnected' })); } catch (_) {}
+    }
+
+    console.log('[RECOVER] Stream restored');
+  } catch (err) {
+    console.error('[RECOVER] Failed:', err.message);
+    await unbindCurrent(_activeDevice).catch(() => {});
+    // Tell clients to reload
+    for (const ws of wss.clients) {
+      if (ws.readyState === ws.OPEN)
+        try { ws.send(JSON.stringify({ type: 'stream_ended' })); } catch (_) {}
+    }
+  } finally {
+    _reconnecting = false;
+  }
+});
+
 // ── GET /api/stream/:deviceId ─────────────────────────────────────────────────
 app.get('/api/stream/:deviceId', async (req, res) => {
   const { deviceId } = req.params;
-  const wantSD       = req.query.quality === 'SD';
+  const streamId     = req.query.quality === 'SD' ? 1 : 0;
 
   if (_streamLock) return res.status(429).json({ error: 'Already connecting — please wait' });
   _streamLock = true;
 
   try {
-    // 1. Stop FFmpeg and unbind IMOU session
     stopStream();
     const hadSession = await unbindCurrent(deviceId);
     if (hadSession) {
-      console.log('[STREAM] Waiting 4s for camera to release session...');
-      await sleep(4000);
+      console.log('[STREAM] Waiting 3s for camera to release session...');
+      await sleep(3000);
     }
 
-    // 2. Bind and get stream URL — single attempt, no retry loop
-    //    (retry loops were stacking sessions and causing error 110030)
-    await request('bindDeviceLive', { deviceId, channelId: '0', streamId: wantSD ? 1 : 0 });
-    await sleep(1000);
-
-    const info    = await request('getLiveStreamInfo', { deviceId, channelId: '0' });
-    const streams = info.streams || [];
-    if (!streams.length) throw new Error('No streams from IMOU');
-
-    const targetId = wantSD ? 1 : 0;
-    const chosen   =
-      streams.find(s => s.hls?.startsWith('http:') && s.streamId === targetId) ||
-      streams.find(s => s.streamId === targetId) || streams[0];
-
-    if (!chosen?.hls) throw new Error('No HLS URL');
-
-    // 3. Check playlist — if error, don't retry (avoids session stacking)
+    const chosen = await bindAndGetUrl(deviceId, streamId);
     const { ok, body } = await fetchPlaylist(chosen.hls);
-    console.log('[STREAM] Playlist:', body.substring(0, 200).replace(/\n/g, ' | '));
+    console.log('[STREAM] Playlist:', body.substring(0, 150).replace(/\n/g, ' | '));
+
     if (!ok) {
-      // Unbind so camera is left clean — user will retry manually
       await unbindCurrent(deviceId);
-      return res.status(502).json({
-        error: 'Camera session not ready — wait 15s and try again',
-        hint: body.includes('110030') ? 'Error 110030: too many sessions. Wait 15s.' : 'Camera busy'
-      });
+      return res.status(502).json({ error: 'Camera not ready — wait 15s and try again' });
     }
 
-    // 4. Start FFmpeg
-    console.log('[STREAM] Starting FFmpeg with:', chosen.hls.substring(0, 70));
+    console.log('[STREAM] Starting FFmpeg');
+    _activeDevice  = deviceId;
+    _activeQuality = streamId;
     await startStream(chosen.hls);
 
     await new Promise((resolve, reject) => {
@@ -133,34 +196,31 @@ app.get('/api/stream/:deviceId', async (req, res) => {
     res.json({ success: true, wsUrl: '/stream' });
   } catch (err) {
     console.error('[STREAM ERROR]:', err.message);
+    _activeDevice = null;
     res.status(500).json({ error: err.message });
   } finally {
     _streamLock = false;
   }
 });
 
-// ── POST /api/stream/flush — emergency session reset ─────────────────────────
-// Call this when camera is stuck in error 110030
+// ── POST /api/stream/flush ────────────────────────────────────────────────────
 app.post('/api/stream/flush', async (req, res) => {
   const deviceId = req.query.deviceId || process.env.IMOU_DEVICE_ID;
-  console.log('[FLUSH] Force-clearing sessions for', deviceId);
-  stopStream();
+  console.log('[FLUSH] Clearing sessions for', deviceId);
+  stopStream(); _activeDevice = null;
   let unbound = 0;
-  // Try unbinding up to 5 times in case multiple sessions are queued
   for (let i = 0; i < 5; i++) {
     const ok = await unbindCurrent(deviceId);
     if (!ok) break;
-    unbound++;
-    await sleep(500);
+    unbound++; await sleep(500);
   }
-  console.log(`[FLUSH] Unbound ${unbound} session(s)`);
   res.json({ success: true, unbound, message: `Cleared ${unbound} session(s). Wait 15s before connecting.` });
 });
 
 // ── POST /api/stream/stop ─────────────────────────────────────────────────────
 app.post('/api/stream/stop', async (req, res) => {
-  stopStream();
-  const deviceId = req.query.deviceId || process.env.IMOU_DEVICE_ID;
+  const deviceId = _activeDevice || req.query.deviceId || process.env.IMOU_DEVICE_ID;
+  stopStream(); _activeDevice = null; _reconnecting = false;
   if (deviceId) await unbindCurrent(deviceId);
   res.json({ success: true });
 });
@@ -186,21 +246,4 @@ process.on('SIGTERM', () => { stopStream(); process.exit(); });
 server.listen(PORT, () => {
   console.log(`\n🟢 SENTINEL running at http://localhost:${PORT}`);
   console.log(`   Device : ${process.env.IMOU_DEVICE_ID}\n`);
-});
-
-// ── Auto-recover when FFmpeg unexpectedly exits ───────────────────────────────
-// This handles the case where FFmpeg exits mid-stream (code 0 = stream ended,
-// code 1/255 = network error). We unbind the dead IMOU session immediately
-// so it doesn't accumulate, then notify connected clients to reconnect.
-bus.on('end', async () => {
-  const deviceId = process.env.IMOU_DEVICE_ID;
-  if (!deviceId) return;
-  console.log('[RECOVER] FFmpeg ended — cleaning up IMOU session');
-  await unbindCurrent(deviceId);
-  // Tell all connected WS clients the stream died so the browser shows reconnect UI
-  for (const ws of wss.clients) {
-    if (ws.readyState === ws.OPEN) {
-      try { ws.send(JSON.stringify({ type: 'stream_ended' })); } catch (_) {}
-    }
-  }
 });

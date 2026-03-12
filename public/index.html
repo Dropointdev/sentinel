@@ -203,19 +203,32 @@ function openWebSocket(wsPath) {
   });
 
   ws.onmessage = e => {
-    if (typeof e.data === "string") {
+    // JSON control messages from server
+    if (typeof e.data === 'string') {
       try {
         const msg = JSON.parse(e.data);
-        if (msg.type === "stream_ended") {
-          showSpinner(false); showPlaceholder();
-          setStatus("idle", "STREAM ENDED");
-          toast("Stream ended — click Connect to restart");
+        if (msg.type === 'reconnecting') {
+          setStatus('loading', 'RECONNECTING...');
+          showSpinner(true);
+          // Keep video element alive — server will send new init segment
+        } else if (msg.type === 'reconnected') {
+          showSpinner(false);
+          setStatus('live', '● LIVE');
+          // Reset MSE to accept new init segment
+          appendQueue = [];
+          isFlushing  = false;
+          frameCount  = 0;
+        } else if (msg.type === 'stream_ended') {
+          showSpinner(false);
+          showPlaceholder();
+          setStatus('idle', 'STREAM ENDED');
+          toast('Stream ended — click Connect to restart');
         }
       } catch (_) {}
       return;
     }
+
     appendQueue.push(e.data);
-    // Never queue more than 2 fragments — drop oldest immediately
     while (appendQueue.length > 2) appendQueue.shift();
     flushQueue();
 
