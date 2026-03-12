@@ -91,6 +91,7 @@ app.get('/api/stream/:deviceId', async (req, res) => {
     } catch (_) {}
 
     // Retry bind up to 3 times — camera can return error playlist on first attempt
+    // We fetch the actual playlist to check if it contains real segments, not just error stubs
     let chosen = null;
     for (let attempt = 1; attempt <= 3; attempt++) {
       await request('bindDeviceLive', { deviceId, channelId: '0', streamId: wantSD ? 1 : 0 });
@@ -106,11 +107,23 @@ app.get('/api/stream/:deviceId', async (req, res) => {
 
       if (!candidate?.hls) throw new Error('No HLS URL');
 
-      // IMOU returns an error playlist when session isn't ready — URL contains "errorcode"
-      if (candidate.hls.includes('errorcode')) {
-        console.log(`[STREAM] Camera not ready (attempt ${attempt}/3), retrying in 2s...`);
-        try { await request('unbindLive', { liveToken: (data.streams[0]?.liveToken) }); } catch (_) {}
-        await sleep(2000);
+      // Fetch the actual playlist and inspect it
+      // IMOU returns a playlist whose segments point to /errorcode/... when not ready
+      let playlistOk = false;
+      try {
+        const axios   = require('axios');
+        const plRes   = await axios.get(candidate.hls, { timeout: 5000 });
+        const body    = plRes.data || '';
+        // A good live playlist has real .ts segment lines — not errorcode paths
+        playlistOk = body.includes('.ts') && !body.includes('errorcode');
+        console.log(`[STREAM] Playlist check (attempt ${attempt}/3): ${playlistOk ? 'OK' : 'ERROR segments'}`);
+      } catch (e) {
+        console.log(`[STREAM] Playlist fetch failed (attempt ${attempt}/3):`, e.message);
+      }
+
+      if (!playlistOk) {
+        try { await request('unbindLive', { liveToken: candidate.liveToken || data.streams[0]?.liveToken }); } catch (_) {}
+        if (attempt < 3) { await sleep(3000); }
         continue;
       }
 
@@ -118,7 +131,7 @@ app.get('/api/stream/:deviceId', async (req, res) => {
       break;
     }
 
-    if (!chosen) return res.status(502).json({ error: 'Camera not ready after 3 attempts' });
+    if (!chosen) return res.status(502).json({ error: 'Camera not ready after 3 attempts — try again in a few seconds' });
 
     console.log('[STREAM] Starting with fresh URL:', chosen.hls.substring(0, 70));
     await startStream(chosen.hls);

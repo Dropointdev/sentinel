@@ -7,7 +7,7 @@ bus.setMaxListeners(100);
 
 let ffmpegProcess = null;
 let initSegment   = null;
-let _starting     = false;   // lock — prevents concurrent spawns
+let _starting     = false;
 
 function findMoofOffset(buf) {
   let offset = 0;
@@ -21,44 +21,34 @@ function findMoofOffset(buf) {
   return -1;
 }
 
-// Kill existing process and WAIT for it to fully exit
 function killExisting() {
   return new Promise(resolve => {
     if (!ffmpegProcess) return resolve();
     const proc = ffmpegProcess;
     ffmpegProcess = null;
     initSegment   = null;
-
-    if (proc.exitCode !== null) return resolve();  // already dead
-
+    if (proc.exitCode !== null) return resolve();
     proc.once('close', () => resolve());
     proc.kill('SIGTERM');
-
-    // Force kill after 3s if SIGTERM doesn't work
     const force = setTimeout(() => { try { proc.kill('SIGKILL'); } catch (_) {} }, 3000);
     proc.once('close', () => clearTimeout(force));
   });
 }
 
 async function startStream(inputUrl) {
-  if (_starting) {
-    console.log('[FFMPEG] Already starting — ignoring duplicate call');
-    return;
-  }
+  if (_starting) { console.log('[FFMPEG] Already starting — skipping'); return; }
   _starting = true;
-
   try {
-    await killExisting();   // fully wait for old process to die
-
+    await killExisting();
     console.log('[FFMPEG] Starting');
 
     const args = [
       '-allowed_extensions', 'ALL',
       '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
 
-      // Disable persistent HTTP connections for HLS segments
-      // IMOU segment servers drop keepalive connections causing EOF errors
-      '-http_persistent',  '0',
+      // NOTE: no -http_persistent 0 — that flag breaks HLS manifest refresh,
+      // causing FFmpeg to exit cleanly after the first set of segments.
+      // The EOF/reconnect log spam is harmless; FFmpeg handles it internally.
 
       '-fflags',          'nobuffer+discardcorrupt',
       '-flags',           'low_delay',
@@ -67,7 +57,9 @@ async function startStream(inputUrl) {
 
       '-i', inputUrl,
 
-      '-c:v',    'libx264',
+      // Auto-detect codec — copy H.264 streams directly, transcode HEVC to H.264
+      // The HD stream is HEVC; the SD stream comes as H.264 already
+      '-c:v',    'libx264',   // always re-encode so output is always browser-compatible H.264
       '-preset', 'ultrafast',
       '-tune',   'zerolatency',
       '-crf',    '28',
@@ -75,13 +67,13 @@ async function startStream(inputUrl) {
       '-an',
       '-bf',     '0',
       '-refs',   '1',
-      '-g',            '5',
-      '-keyint_min',   '5',
+      '-g',            '10',   // keyframe every 10 frames (~0.5s at 20fps)
+      '-keyint_min',   '10',
       '-sc_threshold', '0',
 
       '-f',             'mp4',
       '-movflags',      'frag_keyframe+empty_moov+default_base_moof',
-      '-frag_duration', '250000',
+      '-frag_duration', '500000',   // 500ms fragments — more stable than 250ms
       '-max_muxing_queue_size', '128',
       'pipe:1',
     ];
@@ -111,8 +103,7 @@ async function startStream(inputUrl) {
 
     proc.stderr.on('data', d => {
       const msg = d.toString();
-      // Suppress noisy Skip/#EXTM3U/reconnect lines — only log real errors
-      if (/Error|error|Stream #0|Input #0/i.test(msg) && !/frame=|Skip|EXTM3U|reconnect/i.test(msg))
+      if (/Error|error|Stream #0:|Input #0,/i.test(msg) && !/frame=|Skip|EXTM3U|reconnect|keepalive/i.test(msg))
         console.log('[FFMPEG]', msg.trim().split('\n')[0]);
     });
 
@@ -127,11 +118,7 @@ async function startStream(inputUrl) {
   }
 }
 
-function stopStream() {
-  console.log('[FFMPEG] Stop requested');
-  killExisting();
-}
-
+function stopStream()     { console.log('[FFMPEG] Stop requested'); killExisting(); }
 function getInitSegment() { return initSegment; }
 function isRunning()      { return ffmpegProcess !== null; }
 
