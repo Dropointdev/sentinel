@@ -271,17 +271,19 @@ function flushQueue() {
 
 function onUpdateEnd() {
   isFlushing = false;
-  trimBuffer();
+  trimBuffer();   // trim BEFORE next append — runs every fragment
   flushQueue();
 }
 
-// Keep only 0.8s behind current time — enough to play smooth, not enough to drift
+// Trim everything older than 1s behind playhead — runs after every fragment
+// This is what keeps latency from growing — must not be blocked
 function trimBuffer() {
   const video = document.getElementById('cam-video');
-  if (!video || !sourceBuffer || sourceBuffer.updating || !sourceBuffer.buffered.length) return;
-  const trimTo = video.currentTime - 0.8;
+  if (!video || !sourceBuffer || sourceBuffer.updating) return;
+  if (!sourceBuffer.buffered.length) return;
   const start  = sourceBuffer.buffered.start(0);
-  if (trimTo > start + 0.3) {
+  const trimTo = video.currentTime - 1.0;
+  if (trimTo > start + 0.5) {
     try {
       isFlushing = true;
       sourceBuffer.remove(start, trimTo);
@@ -289,31 +291,34 @@ function trimBuffer() {
   }
 }
 
-// ── Latency monitor ───────────────────────────────────────────────────────────
+// ── Latency monitor — runs every 200ms, forces jump to live edge ──────────────
 function startLatencyTimer() {
   stopLatencyTimer();
   const video = document.getElementById('cam-video');
   const latEl = document.getElementById('latency');
 
   latencyTimer = setInterval(() => {
-    if (!video || !sourceBuffer || !video.buffered.length) return;
+    if (!video || !video.buffered.length) return;
 
-    const bufferedEnd = video.buffered.end(video.buffered.length - 1);
-    const latencyMs   = Math.round((bufferedEnd - video.currentTime) * 1000);
+    const end       = video.buffered.end(video.buffered.length - 1);
+    const latencyMs = Math.round((end - video.currentTime) * 1000);
 
     if (latEl) {
-      latEl.textContent = `${latencyMs}ms`;
-      latEl.className   = 'latency ' + (latencyMs < 800 ? 'good' : latencyMs < 1500 ? 'warn' : 'bad');
+      latEl.textContent = latencyMs + 'ms';
+      latEl.className   = 'latency ' + (latencyMs < 1000 ? 'good' : latencyMs < 2500 ? 'warn' : 'bad');
     }
 
-    // Jump to live edge if drifted more than 500ms
-    if (latencyMs > 500 && !video.paused && !video.seeking) {
-      video.currentTime = bufferedEnd - 0.1;
+    // Always jump to live edge if more than 1.5s behind — no conditions
+    if (latencyMs > 1500) {
+      console.log('[LATENCY] ' + latencyMs + 'ms — jumping to live edge');
+      video.currentTime = end - 0.2;
     }
 
-    // Nudge if stalled
-    if (video.paused && frameCount > 5) video.play().catch(() => {});
-  }, 250); // check 4x per second — matches 250ms fragment size
+    // Kick video if stalled
+    if (video.paused && frameCount > 5 && !video.seeking) {
+      video.play().catch(() => {});
+    }
+  }, 200);
 }
 
 function stopLatencyTimer() {
