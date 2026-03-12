@@ -23,36 +23,45 @@ function findMoofOffset(buf) {
 function startStream(inputUrl) {
   if (ffmpegProcess) { ffmpegProcess.kill('SIGTERM'); ffmpegProcess = null; initSegment = null; }
 
-  console.log('[FFMPEG] Starting');
+  console.log('[FFMPEG] Starting — sub-1s latency mode');
 
   const args = [
     '-allowed_extensions', 'ALL',
     '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
-    '-fflags',          'nobuffer+discardcorrupt',
+
+    // Minimize input buffering — start decoding immediately
+    '-fflags',          'nobuffer+discardcorrupt+flush_packets',
     '-flags',           'low_delay',
-    '-probesize',       '500000',
-    '-analyzeduration', '500000',
+    '-avioflags',       'direct',
+    '-probesize',       '32',
+    '-analyzeduration', '0',
+
     '-i', inputUrl,
 
-    '-c:v',      'libx264',
-    '-preset',   'ultrafast',
-    '-tune',     'zerolatency',
-    '-crf',      '28',
-    '-vf',       'scale=1280:-2',
+    // HEVC → H.264
+    '-c:v',    'libx264',
+    '-preset', 'ultrafast',
+    '-tune',   'zerolatency',
+    '-crf',    '28',
+    '-vf',     'scale=1280:-2',
     '-an',
 
-    // Keyframe every 2s at 20fps — gives clean fragment boundaries
-    '-g',            '40',
-    '-keyint_min',   '40',
+    // Keyframe every 5 frames at 20fps = 0.25s
+    // Fragments split on keyframes — so fragment = 0.25s
+    '-g',            '5',
+    '-keyint_min',   '5',
     '-sc_threshold', '0',
+    '-forced-idr',   '1',
 
-    // 1s fragments — large enough to be smooth, small enough for low latency
+    // No B-frames — they require future frames, adding latency
+    '-bf',   '0',
+    '-refs', '1',
+
+    // fMP4 pipe — 250ms fragments
     '-f',             'mp4',
     '-movflags',      'frag_keyframe+empty_moov+default_base_moof',
-    '-frag_duration', '1000000',
-
-    // Prevent FFmpeg internal queue from growing
-    '-max_muxing_queue_size', '128',
+    '-frag_duration', '250000',
+    '-max_muxing_queue_size', '64',
 
     'pipe:1',
   ];
@@ -92,8 +101,8 @@ function startStream(inputUrl) {
   });
 }
 
-function stopStream()    { if (ffmpegProcess) { ffmpegProcess.kill('SIGTERM'); ffmpegProcess = null; initSegment = null; } }
+function stopStream()     { if (ffmpegProcess) { ffmpegProcess.kill('SIGTERM'); ffmpegProcess = null; initSegment = null; } }
 function getInitSegment() { return initSegment; }
-function isRunning()     { return ffmpegProcess !== null; }
+function isRunning()      { return ffmpegProcess !== null; }
 
 module.exports = { startStream, stopStream, getInitSegment, isRunning, bus };

@@ -96,7 +96,7 @@
 <main id="main"></main>
 <footer>
   <span id="footer-msg">AWAITING CONNECTION</span>
-  <span>SENTINEL v4.1 // WS+MSE // IMOU</span>
+  <span>SENTINEL v4.2 // WS+MSE // SUB-1S</span>
 </footer>
 <div id="toast"></div>
 
@@ -106,8 +106,8 @@ let currentQuality = 'HD';
 let ws             = null;
 let mediaSource    = null;
 let sourceBuffer   = null;
-let appendQueue    = [];     // chunks waiting to be appended
-let isFlushing     = false;  // true while sourceBuffer.appendBuffer() is running
+let appendQueue    = [];
+let isFlushing     = false;
 let frameCount     = 0;
 let latencyTimer   = null;
 
@@ -161,11 +161,10 @@ async function loadStream() {
   showSpinner(true);
   hidePlaceholder();
   setFooter('STARTING STREAM...');
-
   try {
     const res  = await fetch(`/api/stream/${DEVICE_ID}?quality=${currentQuality}`);
     const json = await res.json();
-    if (!json.success) throw new Error(json.error || 'Failed to start stream');
+    if (!json.success) throw new Error(json.error || 'Failed');
     openWebSocket(json.wsUrl);
   } catch (err) {
     showSpinner(false); showPlaceholder();
@@ -181,7 +180,7 @@ function openWebSocket(wsPath) {
   frameCount = 0;
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws          = new WebSocket(`${proto}//${location.host}${wsPath}`);
+  ws = new WebSocket(`${proto}//${location.host}${wsPath}`);
   ws.binaryType = 'arraybuffer';
 
   const mimeType =
@@ -191,13 +190,13 @@ function openWebSocket(wsPath) {
     .find(m => MediaSource.isTypeSupported(m))
     || 'video/mp4; codecs="avc1.42E028"';
 
-  mediaSource     = new MediaSource();
-  const video     = document.getElementById('cam-video');
-  video.src       = URL.createObjectURL(mediaSource);
+  mediaSource = new MediaSource();
+  const video = document.getElementById('cam-video');
+  video.src   = URL.createObjectURL(mediaSource);
 
   mediaSource.addEventListener('sourceopen', () => {
     try {
-      sourceBuffer = mediaSource.addSourceBuffer(mimeType);
+      sourceBuffer      = mediaSource.addSourceBuffer(mimeType);
       sourceBuffer.mode = 'segments';
       sourceBuffer.addEventListener('updateend', onUpdateEnd);
     } catch (e) { toast('MSE init failed: ' + e.message, true); }
@@ -205,17 +204,13 @@ function openWebSocket(wsPath) {
 
   ws.onmessage = e => {
     appendQueue.push(e.data);
-    // Hard cap — if queue backs up drop everything except latest chunk
-    // This prevents latency from ever growing beyond ~2 fragments
-    if (appendQueue.length > 4) {
-      console.warn('[MSE] Queue backed up, dropping old chunks');
-      appendQueue = appendQueue.slice(-2);
-    }
+    // Never queue more than 2 fragments — drop oldest immediately
+    while (appendQueue.length > 2) appendQueue.shift();
     flushQueue();
 
     frameCount++;
     if (frameCount === 1) video.play().catch(() => {});
-    if (frameCount === 4) {
+    if (frameCount === 3) {
       showSpinner(false);
       setStatus('live', '● LIVE');
       toast('Stream connected');
@@ -223,12 +218,12 @@ function openWebSocket(wsPath) {
   };
 
   ws.onclose = () => { setStatus('idle', 'DISCONNECTED'); stopLatencyTimer(); };
-  ws.onerror = () => { setStatus('error', '✕ WS ERR'); toast('WebSocket error — reconnecting', true); };
+  ws.onerror = () => { setStatus('error', '✕ WS ERR'); toast('WebSocket error', true); };
 
   startLatencyTimer();
 }
 
-// ── MSE append pipeline ───────────────────────────────────────────────────────
+// ── MSE pipeline ──────────────────────────────────────────────────────────────
 function flushQueue() {
   if (isFlushing || !sourceBuffer || sourceBuffer.updating || appendQueue.length === 0) return;
   isFlushing = true;
@@ -237,26 +232,22 @@ function flushQueue() {
   } catch (e) {
     isFlushing = false;
     if (e.name === 'QuotaExceededError') trimBuffer();
-    else console.error('[MSE] appendBuffer error:', e.message);
   }
 }
 
 function onUpdateEnd() {
   isFlushing = false;
-  trimBuffer();    // trim BEFORE next append — keeps buffer lean always
+  trimBuffer();
   flushQueue();
 }
 
-// Remove everything older than 2s behind current position
-// This is what prevents latency growth — runs after EVERY fragment
+// Keep only 0.8s behind current time — enough to play smooth, not enough to drift
 function trimBuffer() {
   const video = document.getElementById('cam-video');
-  if (!video || !sourceBuffer || sourceBuffer.updating) return;
-  if (!sourceBuffer.buffered.length) return;
-
-  const trimTo = video.currentTime - 2;
+  if (!video || !sourceBuffer || sourceBuffer.updating || !sourceBuffer.buffered.length) return;
+  const trimTo = video.currentTime - 0.8;
   const start  = sourceBuffer.buffered.start(0);
-  if (trimTo > start + 0.5) {
+  if (trimTo > start + 0.3) {
     try {
       isFlushing = true;
       sourceBuffer.remove(start, trimTo);
@@ -264,7 +255,7 @@ function trimBuffer() {
   }
 }
 
-// ── Latency monitor — keeps video glued to live edge ─────────────────────────
+// ── Latency monitor ───────────────────────────────────────────────────────────
 function startLatencyTimer() {
   stopLatencyTimer();
   const video = document.getElementById('cam-video');
@@ -276,24 +267,19 @@ function startLatencyTimer() {
     const bufferedEnd = video.buffered.end(video.buffered.length - 1);
     const latencyMs   = Math.round((bufferedEnd - video.currentTime) * 1000);
 
-    // Update latency badge with colour coding
     if (latEl) {
       latEl.textContent = `${latencyMs}ms`;
-      latEl.className   = 'latency ' + (latencyMs < 1500 ? 'good' : latencyMs < 3000 ? 'warn' : 'bad');
+      latEl.className   = 'latency ' + (latencyMs < 800 ? 'good' : latencyMs < 1500 ? 'warn' : 'bad');
     }
 
-    // If we've drifted more than 1.5s behind live edge, jump forward
-    // Do this smoothly — don't jump if video is paused or seeking
-    if (latencyMs > 1500 && !video.paused && !video.seeking) {
-      video.currentTime = bufferedEnd - 0.2;
-      console.log(`[LATENCY] Corrected ${latencyMs}ms → jumped to live edge`);
+    // Jump to live edge if drifted more than 500ms
+    if (latencyMs > 500 && !video.paused && !video.seeking) {
+      video.currentTime = bufferedEnd - 0.1;
     }
 
-    // If video has stalled, nudge it
-    if (video.paused && latencyMs > 0) {
-      video.play().catch(() => {});
-    }
-  }, 1000);
+    // Nudge if stalled
+    if (video.paused && frameCount > 5) video.play().catch(() => {});
+  }, 250); // check 4x per second — matches 250ms fragment size
 }
 
 function stopLatencyTimer() {
@@ -317,10 +303,8 @@ function stopStream() {
 function closeAll() {
   stopLatencyTimer();
   if (ws) { ws.close(); ws = null; }
-  mediaSource  = null;
-  sourceBuffer = null;
-  appendQueue  = [];
-  isFlushing   = false;
+  mediaSource = null; sourceBuffer = null;
+  appendQueue = []; isFlushing = false;
 }
 
 // ── Controls ──────────────────────────────────────────────────────────────────
@@ -342,13 +326,10 @@ function setStatus(type, text) {
   const el = document.getElementById('status-tag');
   if (el) { el.className = `tag ${type}`; el.textContent = text; }
 }
-function showSpinner(on) {
-  const el = document.getElementById('spinner');
-  if (el) el.classList.toggle('on', on);
-}
-function showPlaceholder() { const el = document.getElementById('placeholder'); if (el) el.style.display = 'flex'; }
-function hidePlaceholder() { const el = document.getElementById('placeholder'); if (el) el.style.display = 'none'; }
-function setFooter(msg) { document.getElementById('footer-msg').textContent = msg; }
+function showSpinner(on)  { const el = document.getElementById('spinner');     if (el) el.classList.toggle('on', on); }
+function showPlaceholder(){ const el = document.getElementById('placeholder'); if (el) el.style.display = 'flex'; }
+function hidePlaceholder(){ const el = document.getElementById('placeholder'); if (el) el.style.display = 'none'; }
+function setFooter(msg)   { document.getElementById('footer-msg').textContent = msg; }
 function toast(msg, isErr = false) {
   const t = document.getElementById('toast');
   t.textContent = msg;
@@ -368,10 +349,9 @@ fetch('/api/health')
   .then(r => r.json())
   .then(d => {
     setFooter(d.online ? 'DEVICE ONLINE — READY TO STREAM' : 'DEVICE OFFLINE');
-    if (d.online) toast('Device online');
-    else toast('Device appears offline', true);
+    toast(d.online ? 'Device online' : 'Device appears offline', !d.online);
   })
-  .catch(err => { setFooter('INIT FAILED — ' + err.message); });
+  .catch(err => setFooter('INIT FAILED — ' + err.message));
 </script>
 </body>
 </html>
