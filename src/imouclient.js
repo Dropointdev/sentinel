@@ -24,8 +24,8 @@ async function callApi(api, params = {}) {
   return result.data || {};
 }
 
-async function getToken() {
-  if (_token && Date.now() / 1000 < _expiry - 60) return _token;
+async function getToken(forceRefresh = false) {
+  if (!forceRefresh && _token && Date.now() / 1000 < _expiry - 60) return _token;
   const data = await callApi('accessToken', {});
   _token  = data.accessToken;
   _expiry = data.expireTime;
@@ -34,8 +34,19 @@ async function getToken() {
 }
 
 async function request(api, params = {}) {
-  const token = await getToken();
-  return callApi(api, { ...params, token });
+  // First attempt with cached token
+  try {
+    return await callApi(api, { ...params, token: await getToken() });
+  } catch (err) {
+    // OP1009 = token invalidated server-side (e.g. after camera reboot)
+    // Force a fresh token and retry once
+    if (err.message.includes('OP1009')) {
+      console.log('[IMOU] OP1009 — forcing token refresh and retrying');
+      _token = null; _expiry = 0;
+      return await callApi(api, { ...params, token: await getToken(true) });
+    }
+    throw err;
+  }
 }
 
 module.exports = { request };
