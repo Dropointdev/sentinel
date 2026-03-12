@@ -79,22 +79,45 @@ app.get('/api/stream/:deviceId', async (req, res) => {
   try {
     const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-    // Unbind any existing session
-    try {
-      const info = await request('getLiveStreamInfo', { deviceId, channelId: '0' });
-      const tok  = (info.streams || [])[0]?.liveToken;
-      if (tok) {
-        await request('unbindLive', { liveToken: tok });
-        console.log('[STREAM] Unbound old session — waiting 3s for camera to reset');
-        await sleep(3000);   // camera needs time to fully release the session
-      }
-    } catch (_) {}
+    const axios = require('axios');
 
-    // Retry bind up to 3 times — camera can return error playlist on first attempt
-    // We fetch the actual playlist to check if it contains real segments, not just error stubs
+    // Helper: fully unbind any live session for this device
+    async function unbindAll() {
+      try {
+        const info = await request('getLiveStreamInfo', { deviceId, channelId: '0' });
+        for (const s of (info.streams || [])) {
+          if (s.liveToken) {
+            try { await request('unbindLive', { liveToken: s.liveToken }); } catch (_) {}
+          }
+        }
+      } catch (_) {}
+    }
+
+    // Helper: fetch playlist and check it has real segments
+    async function checkPlaylist(url) {
+      try {
+        const r    = await axios.get(url, { timeout: 6000 });
+        const body = String(r.data || '');
+        // Log first 300 chars so we can see what IMOU is actually returning
+        console.log('[STREAM] Playlist preview:', body.substring(0, 300).replace(/\n/g, ' | '));
+        return body.includes('.ts') && !body.includes('errorcode');
+      } catch (e) {
+        console.log('[STREAM] Playlist fetch error:', e.message);
+        return false;
+      }
+    }
+
+    // Unbind everything first, then wait for camera to fully reset
+    await unbindAll();
+    console.log('[STREAM] Waiting 5s for camera session to fully reset...');
+    await sleep(5000);
+
+    // Single bind → check → if bad, full unbind+wait cycle (max 3 rounds)
     let chosen = null;
     for (let attempt = 1; attempt <= 3; attempt++) {
+      console.log(`[STREAM] Bind attempt ${attempt}/3`);
       await request('bindDeviceLive', { deviceId, channelId: '0', streamId: wantSD ? 1 : 0 });
+      await sleep(1500);  // brief pause for camera to prepare playlist after bind
 
       const data    = await request('getLiveStreamInfo', { deviceId, channelId: '0' });
       const streams = data.streams || [];
@@ -105,33 +128,22 @@ app.get('/api/stream/:deviceId', async (req, res) => {
         streams.find(s => s.hls?.startsWith('http:') && s.streamId === targetId) ||
         streams.find(s => s.streamId === targetId) || streams[0];
 
-      if (!candidate?.hls) throw new Error('No HLS URL');
+      if (!candidate?.hls) throw new Error('No HLS URL in response');
 
-      // Fetch the actual playlist and inspect it
-      // IMOU returns a playlist whose segments point to /errorcode/... when not ready
-      let playlistOk = false;
-      try {
-        const axios   = require('axios');
-        const plRes   = await axios.get(candidate.hls, { timeout: 5000 });
-        const body    = plRes.data || '';
-        // A good live playlist has real .ts segment lines — not errorcode paths
-        playlistOk = body.includes('.ts') && !body.includes('errorcode');
-        console.log(`[STREAM] Playlist check (attempt ${attempt}/3): ${playlistOk ? 'OK' : 'ERROR segments'}`);
-      } catch (e) {
-        console.log(`[STREAM] Playlist fetch failed (attempt ${attempt}/3):`, e.message);
+      const ok = await checkPlaylist(candidate.hls);
+      console.log(`[STREAM] Playlist check (attempt ${attempt}/3): ${ok ? 'OK' : 'ERROR segments'}`);
+
+      if (ok) { chosen = candidate; break; }
+
+      // Not ready — full unbind and longer wait before next attempt
+      await unbindAll();
+      if (attempt < 3) {
+        console.log('[STREAM] Waiting 5s before retry...');
+        await sleep(5000);
       }
-
-      if (!playlistOk) {
-        try { await request('unbindLive', { liveToken: candidate.liveToken || data.streams[0]?.liveToken }); } catch (_) {}
-        if (attempt < 3) { await sleep(3000); }
-        continue;
-      }
-
-      chosen = candidate;
-      break;
     }
 
-    if (!chosen) return res.status(502).json({ error: 'Camera not ready after 3 attempts — try again in a few seconds' });
+    if (!chosen) return res.status(502).json({ error: 'Camera not ready after 3 attempts — wait 10s and try again' });
 
     console.log('[STREAM] Starting with fresh URL:', chosen.hls.substring(0, 70));
     await startStream(chosen.hls);
