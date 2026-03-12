@@ -7,6 +7,8 @@ const { WebSocketServer } = require('ws');
 const { request } = require('./imouclient');
 const { startStream, stopStream, getInitSegment, isRunning, bus } = require('./ffmpegstreamer');
 
+let _streamLock = false;  // prevent concurrent /api/stream calls
+
 const app    = express();
 const server = http.createServer(app);
 const PORT   = process.env.PORT || 4000;
@@ -68,6 +70,12 @@ app.get('/api/stream/:deviceId', async (req, res) => {
   const { deviceId } = req.params;
   const wantSD       = req.query.quality === 'SD';
 
+  if (_streamLock) {
+    console.log('[STREAM] Locked — concurrent request rejected');
+    return res.status(429).json({ error: 'Stream start in progress, try again' });
+  }
+  _streamLock = true;
+
   try {
     // Always unbind old session and get a fresh URL
     // Reusing a URL after FFmpeg dies causes 404 (URL expires with the session)
@@ -105,6 +113,8 @@ app.get('/api/stream/:deviceId', async (req, res) => {
   } catch (err) {
     console.error('[STREAM ERROR]:', err.message);
     res.status(500).json({ error: err.message });
+  } finally {
+    _streamLock = false;
   }
 });
 
