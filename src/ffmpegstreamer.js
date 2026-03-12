@@ -29,12 +29,11 @@ function startStream(inputUrl) {
     '-allowed_extensions', 'ALL',
     '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
 
-    // Minimize input buffering — start decoding immediately
-    '-fflags',          'nobuffer+discardcorrupt+flush_packets',
+    // Minimize input buffering
+    '-fflags',          'nobuffer+discardcorrupt',
     '-flags',           'low_delay',
-    '-avioflags',       'direct',
-    '-probesize',       '32',
-    '-analyzeduration', '0',
+    '-probesize',       '1000000',  // needs to be large enough to detect HEVC over HLS
+    '-analyzeduration', '1000000',
 
     '-i', inputUrl,
 

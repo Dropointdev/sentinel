@@ -96,7 +96,7 @@ app.get('/api/stream/:deviceId', async (req, res) => {
 
     await new Promise((resolve, reject) => {
       if (getInitSegment()) return resolve();
-      const t = setTimeout(() => reject(new Error('FFmpeg init timeout')), 12000);
+      const t = setTimeout(() => reject(new Error('FFmpeg init timeout')), 20000);
       bus.once('init', () => { clearTimeout(t); resolve(); });
     });
 
