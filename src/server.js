@@ -77,36 +77,58 @@ app.get('/api/stream/:deviceId', async (req, res) => {
   _streamLock = true;
 
   try {
-    // Always unbind old session and get a fresh URL
-    // Reusing a URL after FFmpeg dies causes 404 (URL expires with the session)
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+    // Unbind any existing session
     try {
       const info = await request('getLiveStreamInfo', { deviceId, channelId: '0' });
       const tok  = (info.streams || [])[0]?.liveToken;
-      if (tok) { await request('unbindLive', { liveToken: tok }); console.log('[STREAM] Unbound old session'); }
+      if (tok) {
+        await request('unbindLive', { liveToken: tok });
+        console.log('[STREAM] Unbound old session — waiting 3s for camera to reset');
+        await sleep(3000);   // camera needs time to fully release the session
+      }
     } catch (_) {}
 
-    await request('bindDeviceLive', { deviceId, channelId: '0', streamId: wantSD ? 1 : 0 });
+    // Retry bind up to 3 times — camera can return error playlist on first attempt
+    let chosen = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await request('bindDeviceLive', { deviceId, channelId: '0', streamId: wantSD ? 1 : 0 });
 
-    const data    = await request('getLiveStreamInfo', { deviceId, channelId: '0' });
-    const streams = data.streams || [];
-    if (!streams.length) return res.status(502).json({ error: 'No streams returned' });
+      const data    = await request('getLiveStreamInfo', { deviceId, channelId: '0' });
+      const streams = data.streams || [];
+      if (!streams.length) throw new Error('No streams returned');
 
-    const targetId = wantSD ? 1 : 0;
-    const chosen   =
-      streams.find(s => s.hls?.startsWith('http:') && s.streamId === targetId) ||
-      streams.find(s => s.streamId === targetId) || streams[0];
+      const targetId = wantSD ? 1 : 0;
+      const candidate =
+        streams.find(s => s.hls?.startsWith('http:') && s.streamId === targetId) ||
+        streams.find(s => s.streamId === targetId) || streams[0];
 
-    if (!chosen?.hls) return res.status(502).json({ error: 'No HLS URL' });
+      if (!candidate?.hls) throw new Error('No HLS URL');
+
+      // IMOU returns an error playlist when session isn't ready — URL contains "errorcode"
+      if (candidate.hls.includes('errorcode')) {
+        console.log(`[STREAM] Camera not ready (attempt ${attempt}/3), retrying in 2s...`);
+        try { await request('unbindLive', { liveToken: (data.streams[0]?.liveToken) }); } catch (_) {}
+        await sleep(2000);
+        continue;
+      }
+
+      chosen = candidate;
+      break;
+    }
+
+    if (!chosen) return res.status(502).json({ error: 'Camera not ready after 3 attempts' });
 
     console.log('[STREAM] Starting with fresh URL:', chosen.hls.substring(0, 70));
-    startStream(chosen.hls);
+    await startStream(chosen.hls);
 
     await new Promise((resolve, reject) => {
       if (getInitSegment()) return resolve();
       const t = setTimeout(() => reject(new Error('FFmpeg init timeout')), 20000);
-      bus.once('init', () => { clearTimeout(t); resolve(); });
-      // Also reject if FFmpeg exits before producing init
-      bus.once('end', () => { clearTimeout(t); reject(new Error('FFmpeg exited before producing stream')); });
+      bus.once('init', () => { clearTimeout(t); bus.removeListener('end', onEnd); resolve(); });
+      const onEnd = () => { clearTimeout(t); reject(new Error('FFmpeg exited before producing stream')); };
+      bus.once('end', onEnd);
     });
 
     res.json({ success: true, wsUrl: '/stream' });
