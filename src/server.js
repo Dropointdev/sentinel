@@ -68,15 +68,13 @@ app.get('/api/stream/:deviceId', async (req, res) => {
   const { deviceId } = req.params;
   const wantSD       = req.query.quality === 'SD';
 
-  if (isRunning() && getInitSegment()) {
-    return res.json({ success: true, wsUrl: '/stream' });
-  }
-
   try {
+    // Always unbind old session and get a fresh URL
+    // Reusing a URL after FFmpeg dies causes 404 (URL expires with the session)
     try {
       const info = await request('getLiveStreamInfo', { deviceId, channelId: '0' });
       const tok  = (info.streams || [])[0]?.liveToken;
-      if (tok) await request('unbindLive', { liveToken: tok });
+      if (tok) { await request('unbindLive', { liveToken: tok }); console.log('[STREAM] Unbound old session'); }
     } catch (_) {}
 
     await request('bindDeviceLive', { deviceId, channelId: '0', streamId: wantSD ? 1 : 0 });
@@ -92,12 +90,15 @@ app.get('/api/stream/:deviceId', async (req, res) => {
 
     if (!chosen?.hls) return res.status(502).json({ error: 'No HLS URL' });
 
+    console.log('[STREAM] Starting with fresh URL:', chosen.hls.substring(0, 70));
     startStream(chosen.hls);
 
     await new Promise((resolve, reject) => {
       if (getInitSegment()) return resolve();
       const t = setTimeout(() => reject(new Error('FFmpeg init timeout')), 20000);
       bus.once('init', () => { clearTimeout(t); resolve(); });
+      // Also reject if FFmpeg exits before producing init
+      bus.once('end', () => { clearTimeout(t); reject(new Error('FFmpeg exited before producing stream')); });
     });
 
     res.json({ success: true, wsUrl: '/stream' });

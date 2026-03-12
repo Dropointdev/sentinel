@@ -29,11 +29,20 @@ function startStream(inputUrl) {
     '-allowed_extensions', 'ALL',
     '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
 
-    // Minimize input buffering
+    // Disable HTTP keepalive — IMOU segment servers drop persistent connections
+    '-headers',         'Connection: close\r\n',
+
+    // Input buffering
     '-fflags',          'nobuffer+discardcorrupt',
     '-flags',           'low_delay',
-    '-probesize',       '1000000',  // needs to be large enough to detect HEVC over HLS
+    '-probesize',       '1000000',
     '-analyzeduration', '1000000',
+
+    // Reconnect if a segment fetch fails (network hiccup)
+    '-reconnect',          '1',
+    '-reconnect_at_eof',   '1',
+    '-reconnect_streamed',  '1',
+    '-reconnect_delay_max', '2',
 
     '-i', inputUrl,
 
