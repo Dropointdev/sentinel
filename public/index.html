@@ -18,7 +18,7 @@
     header{display:flex;align-items:center;justify-content:space-between;padding:14px 28px;border-bottom:1px solid var(--border);background:var(--surface);position:sticky;top:0;z-index:100}
     .logo{font-weight:700;font-size:22px;letter-spacing:6px;color:var(--accent)}
     .logo span{color:var(--text);font-weight:300}
-    .header-meta{display:flex;align-items:center;gap:24px}
+    .header-right{display:flex;align-items:center;gap:24px}
     .live-badge{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;color:var(--green);letter-spacing:2px}
     .live-badge .dot{width:8px;height:8px;border-radius:50%;background:var(--green);animation:blink 1.4s ease-in-out infinite}
     @keyframes blink{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.7)}}
@@ -36,7 +36,7 @@
     .quality-toggle{display:flex}
     .quality-toggle .btn{padding:7px 12px}
     .quality-toggle .btn:first-child{border-right:none}
-    main{padding:20px 28px;display:flex;flex-direction:column;gap:16px}
+    main{padding:20px 28px}
     .camera-card{background:var(--surface);border:1px solid var(--border);overflow:hidden;position:relative;transition:border-color .2s,box-shadow .2s}
     .camera-card:hover{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent),0 0 40px rgba(0,229,255,.06)}
     .camera-card::before,.camera-card::after{content:'';position:absolute;width:18px;height:18px;z-index:10;pointer-events:none}
@@ -62,11 +62,12 @@
     @keyframes spin{to{transform:rotate(360deg)}}
     .card-footer{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-top:1px solid var(--border);background:rgba(0,0,0,.3)}
     .card-footer .devid{font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:1px}
-    .card-footer .actions{display:flex;gap:8px}
+    .card-footer .actions{display:flex;align-items:center;gap:8px}
     .icon-btn{font-family:var(--mono);font-size:10px;letter-spacing:2px;padding:5px 12px;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;transition:all .15s;text-transform:uppercase}
     .icon-btn:hover{border-color:var(--accent);color:var(--accent)}
     .icon-btn.red:hover{border-color:var(--red);color:var(--red)}
-    .latency-badge{font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:1px}
+    .latency{font-family:var(--mono);font-size:10px;min-width:55px;text-align:right}
+    .latency.good{color:var(--green)}.latency.warn{color:#fa0}.latency.bad{color:var(--red)}
     footer{border-top:1px solid var(--border);padding:10px 28px;display:flex;align-items:center;justify-content:space-between;font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:1px}
     #toast{position:fixed;bottom:24px;right:24px;background:var(--surface);border:1px solid var(--accent);color:var(--accent);font-family:var(--mono);font-size:11px;letter-spacing:1px;padding:10px 18px;transform:translateY(60px);opacity:0;transition:all .3s ease;z-index:99999}
     #toast.show{transform:translateY(0);opacity:1}
@@ -76,7 +77,7 @@
 <body>
 <header>
   <div class="logo">SENTINEL <span>// LIVE MONITOR</span></div>
-  <div class="header-meta">
+  <div class="header-right">
     <div class="live-badge"><div class="dot"></div>SYSTEM ONLINE</div>
     <div id="clock">--:--:--</div>
   </div>
@@ -95,7 +96,7 @@
 <main id="main"></main>
 <footer>
   <span id="footer-msg">AWAITING CONNECTION</span>
-  <span>SENTINEL v4.0 // WEBSOCKET+MSE // IMOU LIFE API</span>
+  <span>SENTINEL v4.1 // WS+MSE // IMOU</span>
 </footer>
 <div id="toast"></div>
 
@@ -105,10 +106,12 @@ let currentQuality = 'HD';
 let ws             = null;
 let mediaSource    = null;
 let sourceBuffer   = null;
-let queue          = [];
-let isAppending    = false;
+let appendQueue    = [];     // chunks waiting to be appended
+let isFlushing     = false;  // true while sourceBuffer.appendBuffer() is running
+let frameCount     = 0;
+let latencyTimer   = null;
 
-// ─── CLOCK ───────────────────────────────────────────────────────────────────
+// ── Clock ─────────────────────────────────────────────────────────────────────
 setInterval(() => {
   const t = new Date().toLocaleTimeString('en-GB', { hour12: false });
   document.getElementById('clock').textContent = t;
@@ -116,7 +119,7 @@ setInterval(() => {
   if (el) el.textContent = t;
 }, 1000);
 
-// ─── BUILD CARD ──────────────────────────────────────────────────────────────
+// ── Build card ────────────────────────────────────────────────────────────────
 function buildCard() {
   document.getElementById('main').innerHTML = `
     <div class="camera-card">
@@ -144,7 +147,7 @@ function buildCard() {
       <div class="card-footer">
         <div class="devid">DEVICE // ${DEVICE_ID}</div>
         <div class="actions">
-          <span class="latency-badge" id="latency">--ms</span>
+          <span class="latency good" id="latency">--ms</span>
           <button class="icon-btn" onclick="toggleFullscreen()">FULLSCREEN</button>
           <button class="icon-btn red" onclick="stopStream()">STOP</button>
         </div>
@@ -152,7 +155,7 @@ function buildCard() {
     </div>`;
 }
 
-// ─── LOAD STREAM ─────────────────────────────────────────────────────────────
+// ── Connect ───────────────────────────────────────────────────────────────────
 async function loadStream() {
   setStatus('loading', 'CONNECTING...');
   showSpinner(true);
@@ -163,150 +166,164 @@ async function loadStream() {
     const res  = await fetch(`/api/stream/${DEVICE_ID}?quality=${currentQuality}`);
     const json = await res.json();
     if (!json.success) throw new Error(json.error || 'Failed to start stream');
-
-    connectWebSocket(json.wsUrl);
-    setFooter(`STREAMING // WebSocket+MSE // ${DEVICE_ID}`);
-
+    openWebSocket(json.wsUrl);
   } catch (err) {
-    showSpinner(false);
-    showPlaceholder();
+    showSpinner(false); showPlaceholder();
     setStatus('error', '✕ ERROR');
     setFooter('CONNECTION FAILED');
     toast('Error: ' + err.message, true);
-    console.error('[SENTINEL]', err);
   }
 }
 
-// ─── WEBSOCKET + MSE PLAYER ──────────────────────────────────────────────────
-function connectWebSocket(wsPath) {
-  closeWS();
+// ── WebSocket + MSE ───────────────────────────────────────────────────────────
+function openWebSocket(wsPath) {
+  closeAll();
+  frameCount = 0;
 
-  const proto  = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl  = `${proto}//${location.host}${wsPath}`;
-  console.log('[WS] Connecting to:', wsUrl);
-
-  ws = new WebSocket(wsUrl);
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws          = new WebSocket(`${proto}//${location.host}${wsPath}`);
   ws.binaryType = 'arraybuffer';
 
-  // Pick H.264 mime type (try high → baseline)
   const mimeType =
     ['video/mp4; codecs="avc1.640028"',
      'video/mp4; codecs="avc1.42E028"',
-     'video/mp4; codecs="avc1.42001E"',
-     'video/mp4; codecs="avc1.4d001f"']
+     'video/mp4; codecs="avc1.42001E"']
     .find(m => MediaSource.isTypeSupported(m))
     || 'video/mp4; codecs="avc1.42E028"';
 
-  console.log('[MSE] Using codec:', mimeType);
+  mediaSource     = new MediaSource();
+  const video     = document.getElementById('cam-video');
+  video.src       = URL.createObjectURL(mediaSource);
 
-  mediaSource = new MediaSource();
-  const video = document.getElementById('cam-video');
-  video.src   = URL.createObjectURL(mediaSource);
-
-  let msOpen = false;
   mediaSource.addEventListener('sourceopen', () => {
-    msOpen = true;
     try {
       sourceBuffer = mediaSource.addSourceBuffer(mimeType);
       sourceBuffer.mode = 'segments';
-      sourceBuffer.addEventListener('updateend', drainQueue);
-      console.log('[MSE] SourceBuffer ready');
-    } catch (e) {
-      console.error('[MSE] addSourceBuffer failed:', e);
-      toast('MSE setup failed: ' + e.message, true);
-    }
+      sourceBuffer.addEventListener('updateend', onUpdateEnd);
+    } catch (e) { toast('MSE init failed: ' + e.message, true); }
   });
 
-  let frameCount = 0;
-  let connectedAt = null;
-
-  ws.onopen = () => {
-    connectedAt = Date.now();
-    console.log('[WS] Connected');
-  };
-
   ws.onmessage = e => {
-    if (!sourceBuffer || !msOpen) {
-      queue.push(e.data);
-      return;
+    appendQueue.push(e.data);
+    // Hard cap — if queue backs up drop everything except latest chunk
+    // This prevents latency from ever growing beyond ~2 fragments
+    if (appendQueue.length > 4) {
+      console.warn('[MSE] Queue backed up, dropping old chunks');
+      appendQueue = appendQueue.slice(-2);
     }
-    queue.push(e.data);
-    drainQueue();
+    flushQueue();
 
     frameCount++;
-    if (frameCount === 1) {
-      // First data received — video will start playing shortly
-      video.play().catch(() => {});
-    }
-    if (frameCount === 3) {
-      // After a few chunks, assume video is playing
+    if (frameCount === 1) video.play().catch(() => {});
+    if (frameCount === 4) {
       showSpinner(false);
       setStatus('live', '● LIVE');
       toast('Stream connected');
     }
   };
 
-  ws.onclose = () => {
-    console.log('[WS] Closed');
-    setStatus('idle', 'DISCONNECTED');
-  };
+  ws.onclose = () => { setStatus('idle', 'DISCONNECTED'); stopLatencyTimer(); };
+  ws.onerror = () => { setStatus('error', '✕ WS ERR'); toast('WebSocket error — reconnecting', true); };
 
-  ws.onerror = err => {
-    console.error('[WS] Error:', err);
-    setStatus('error', '✕ WS ERROR');
-    toast('WebSocket error — try reconnecting', true);
-  };
-
-  // Update latency display (browser buffered time vs current time)
-  setInterval(() => {
-    if (!video || !video.buffered.length) return;
-    const bufferedEnd = video.buffered.end(video.buffered.length - 1);
-    const latencyMs   = Math.round((bufferedEnd - video.currentTime) * 1000);
-    const el = document.getElementById('latency');
-    if (el && latencyMs > 0) el.textContent = `${latencyMs}ms`;
-
-    // If buffer grows beyond 1s, skip ahead to live edge
-    if (latencyMs > 1000) {
-      video.currentTime = bufferedEnd - 0.1;
-    }
-  }, 500);
+  startLatencyTimer();
 }
 
-function drainQueue() {
-  if (!sourceBuffer || sourceBuffer.updating || queue.length === 0) return;
+// ── MSE append pipeline ───────────────────────────────────────────────────────
+function flushQueue() {
+  if (isFlushing || !sourceBuffer || sourceBuffer.updating || appendQueue.length === 0) return;
+  isFlushing = true;
   try {
-    sourceBuffer.appendBuffer(queue.shift());
+    sourceBuffer.appendBuffer(appendQueue.shift());
   } catch (e) {
-    if (e.name === 'QuotaExceededError') {
-      // Remove old buffered data to make room
-      const video = document.getElementById('cam-video');
-      if (video && sourceBuffer.buffered.length) {
-        sourceBuffer.remove(0, video.currentTime - 2);
-      }
-    }
+    isFlushing = false;
+    if (e.name === 'QuotaExceededError') trimBuffer();
+    else console.error('[MSE] appendBuffer error:', e.message);
   }
 }
 
-// ─── STOP ────────────────────────────────────────────────────────────────────
+function onUpdateEnd() {
+  isFlushing = false;
+  trimBuffer();    // trim BEFORE next append — keeps buffer lean always
+  flushQueue();
+}
+
+// Remove everything older than 2s behind current position
+// This is what prevents latency growth — runs after EVERY fragment
+function trimBuffer() {
+  const video = document.getElementById('cam-video');
+  if (!video || !sourceBuffer || sourceBuffer.updating) return;
+  if (!sourceBuffer.buffered.length) return;
+
+  const trimTo = video.currentTime - 2;
+  const start  = sourceBuffer.buffered.start(0);
+  if (trimTo > start + 0.5) {
+    try {
+      isFlushing = true;
+      sourceBuffer.remove(start, trimTo);
+    } catch (_) { isFlushing = false; }
+  }
+}
+
+// ── Latency monitor — keeps video glued to live edge ─────────────────────────
+function startLatencyTimer() {
+  stopLatencyTimer();
+  const video = document.getElementById('cam-video');
+  const latEl = document.getElementById('latency');
+
+  latencyTimer = setInterval(() => {
+    if (!video || !sourceBuffer || !video.buffered.length) return;
+
+    const bufferedEnd = video.buffered.end(video.buffered.length - 1);
+    const latencyMs   = Math.round((bufferedEnd - video.currentTime) * 1000);
+
+    // Update latency badge with colour coding
+    if (latEl) {
+      latEl.textContent = `${latencyMs}ms`;
+      latEl.className   = 'latency ' + (latencyMs < 1500 ? 'good' : latencyMs < 3000 ? 'warn' : 'bad');
+    }
+
+    // If we've drifted more than 1.5s behind live edge, jump forward
+    // Do this smoothly — don't jump if video is paused or seeking
+    if (latencyMs > 1500 && !video.paused && !video.seeking) {
+      video.currentTime = bufferedEnd - 0.2;
+      console.log(`[LATENCY] Corrected ${latencyMs}ms → jumped to live edge`);
+    }
+
+    // If video has stalled, nudge it
+    if (video.paused && latencyMs > 0) {
+      video.play().catch(() => {});
+    }
+  }, 1000);
+}
+
+function stopLatencyTimer() {
+  if (latencyTimer) { clearInterval(latencyTimer); latencyTimer = null; }
+}
+
+// ── Stop ──────────────────────────────────────────────────────────────────────
 function stopStream() {
-  closeWS();
+  closeAll();
   const video = document.getElementById('cam-video');
   if (video) { video.pause(); video.src = ''; }
-  mediaSource = null;
-  sourceBuffer = null;
-  queue = [];
   showPlaceholder();
   setStatus('idle', 'NO SIGNAL');
   setFooter('STREAM DISCONNECTED');
+  const latEl = document.getElementById('latency');
+  if (latEl) { latEl.textContent = '--ms'; latEl.className = 'latency good'; }
   toast('Stream disconnected');
   fetch('/api/stream/stop', { method: 'POST' }).catch(() => {});
 }
 
-function closeWS() {
+function closeAll() {
+  stopLatencyTimer();
   if (ws) { ws.close(); ws = null; }
+  mediaSource  = null;
+  sourceBuffer = null;
+  appendQueue  = [];
+  isFlushing   = false;
 }
 
-// ─── CONTROLS ────────────────────────────────────────────────────────────────
+// ── Controls ──────────────────────────────────────────────────────────────────
 function setQuality(q) {
   currentQuality = q;
   document.getElementById('q-hd').classList.toggle('active', q === 'HD');
@@ -316,12 +333,11 @@ function setQuality(q) {
 
 function toggleFullscreen() {
   const wrap = document.querySelector('.video-wrap');
-  if (!wrap) return;
   if (!document.fullscreenElement) wrap.requestFullscreen();
   else document.exitFullscreen();
 }
 
-// ─── UI HELPERS ──────────────────────────────────────────────────────────────
+// ── UI helpers ────────────────────────────────────────────────────────────────
 function setStatus(type, text) {
   const el = document.getElementById('status-tag');
   if (el) { el.className = `tag ${type}`; el.textContent = text; }
@@ -330,23 +346,18 @@ function showSpinner(on) {
   const el = document.getElementById('spinner');
   if (el) el.classList.toggle('on', on);
 }
-function showPlaceholder() {
-  const el = document.getElementById('placeholder');
-  if (el) el.style.display = 'flex';
-}
-function hidePlaceholder() {
-  const el = document.getElementById('placeholder');
-  if (el) el.style.display = 'none';
-}
+function showPlaceholder() { const el = document.getElementById('placeholder'); if (el) el.style.display = 'flex'; }
+function hidePlaceholder() { const el = document.getElementById('placeholder'); if (el) el.style.display = 'none'; }
 function setFooter(msg) { document.getElementById('footer-msg').textContent = msg; }
 function toast(msg, isErr = false) {
   const t = document.getElementById('toast');
   t.textContent = msg;
   t.className = 'show' + (isErr ? ' err' : '');
-  setTimeout(() => { t.className = ''; }, 3500);
+  clearTimeout(t._t);
+  t._t = setTimeout(() => { t.className = ''; }, 3500);
 }
 
-// ─── INIT ────────────────────────────────────────────────────────────────────
+// ── Init ──────────────────────────────────────────────────────────────────────
 fetch('/api/health')
   .then(r => r.json())
   .then(d => {
@@ -360,10 +371,7 @@ fetch('/api/health')
     if (d.online) toast('Device online');
     else toast('Device appears offline', true);
   })
-  .catch(err => {
-    console.error('Init error:', err);
-    setFooter('INIT FAILED — check server logs');
-  });
+  .catch(err => { setFooter('INIT FAILED — ' + err.message); });
 </script>
 </body>
 </html>
