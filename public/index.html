@@ -203,6 +203,17 @@ function openWebSocket(wsPath) {
   });
 
   ws.onmessage = e => {
+    if (typeof e.data === "string") {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === "stream_ended") {
+          showSpinner(false); showPlaceholder();
+          setStatus("idle", "STREAM ENDED");
+          toast("Stream ended — click Connect to restart");
+        }
+      } catch (_) {}
+      return;
+    }
     appendQueue.push(e.data);
     // Never queue more than 2 fragments — drop oldest immediately
     while (appendQueue.length > 2) appendQueue.shift();
@@ -217,7 +228,17 @@ function openWebSocket(wsPath) {
     }
   };
 
-  ws.onclose = () => { setStatus('idle', 'DISCONNECTED'); stopLatencyTimer(); };
+  ws.onclose = (e) => {
+    stopLatencyTimer();
+    // Code 1011 = server killed it (FFmpeg died) — auto reconnect
+    if (e.code === 1011) {
+      setStatus('loading', 'RECONNECTING...');
+      console.log('[WS] Stream died, reconnecting in 2s...');
+      setTimeout(() => loadStream(), 2000);
+    } else {
+      setStatus('idle', 'DISCONNECTED');
+    }
+  };
   ws.onerror = () => { setStatus('error', '✕ WS ERR'); toast('WebSocket error', true); };
 
   startLatencyTimer();

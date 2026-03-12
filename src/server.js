@@ -187,3 +187,20 @@ server.listen(PORT, () => {
   console.log(`\n🟢 SENTINEL running at http://localhost:${PORT}`);
   console.log(`   Device : ${process.env.IMOU_DEVICE_ID}\n`);
 });
+
+// ── Auto-recover when FFmpeg unexpectedly exits ───────────────────────────────
+// This handles the case where FFmpeg exits mid-stream (code 0 = stream ended,
+// code 1/255 = network error). We unbind the dead IMOU session immediately
+// so it doesn't accumulate, then notify connected clients to reconnect.
+bus.on('end', async () => {
+  const deviceId = process.env.IMOU_DEVICE_ID;
+  if (!deviceId) return;
+  console.log('[RECOVER] FFmpeg ended — cleaning up IMOU session');
+  await unbindCurrent(deviceId);
+  // Tell all connected WS clients the stream died so the browser shows reconnect UI
+  for (const ws of wss.clients) {
+    if (ws.readyState === ws.OPEN) {
+      try { ws.send(JSON.stringify({ type: 'stream_ended' })); } catch (_) {}
+    }
+  }
+});
