@@ -43,14 +43,13 @@ function writeConfig() {
   const fs = require('fs');
   let streamLines = '';
   for (const [name, hlsUrl] of Object.entries(activeStreams)) {
-    // Include both video (h264) and audio (aac) so MSE gets both tracks
     streamLines += `  ${name}:\n    - ffmpeg:${hlsUrl}#video=h264&audio=aac\n`;
   }
   const cfg = `api:
   listen: "127.0.0.1:1984"
   origin: "*"
 rtsp:
-  listen: ""
+  listen: "127.0.0.1:8554"
 webrtc:
   listen: ""
 log:
