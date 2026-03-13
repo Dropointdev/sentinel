@@ -40,12 +40,16 @@ function startGo2rtc() {
   return new Promise((resolve, reject) => {
     console.log('[GO2RTC] Starting...');
 
-    // Minimal config — streams added dynamically via API
+    // Minimal config — only API + MSE/WebSocket, no RTSP/WebRTC (Render blocks those ports)
     const cfg = `
 api:
   listen: "127.0.0.1:1984"
+rtsp:
+  disable: true
+webrtc:
+  disable: true
 log:
-  level: warn
+  level: error
 ffmpeg:
   bin: ffmpeg
 streams: {}
@@ -81,9 +85,13 @@ streams: {}
 
 // ── go2rtc stream management ──────────────────────────────────────────────────
 async function g2rAddStream(name, hlsUrl) {
-  // go2rtc ffmpeg source: fetch HLS, transcode HEVC→H264 with low latency flags
-  const src = `ffmpeg:${hlsUrl}#video=h264#hardware`;
-  await axios.put(`${G2R}/api/streams`, null, { params: { name, src } });
+  // go2rtc ffmpeg source: software transcode HEVC→H264
+  // #video=h264 tells go2rtc to transcode to H264 using ffmpeg
+  const src = `ffmpeg:${hlsUrl}#video=h264`;
+  // go2rtc API: PUT /api/streams?name=X  with src as plain text body
+  await axios.put(`${G2R}/api/streams?name=${encodeURIComponent(name)}`, src, {
+    headers: { 'Content-Type': 'text/plain' }
+  });
   console.log(`[GO2RTC] Stream added: ${name}`);
 }
 
