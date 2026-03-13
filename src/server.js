@@ -106,18 +106,39 @@ function startGo2rtc() {
 }
 
 // ── go2rtc stream management ──────────────────────────────────────────────────
+let _startTimer = null;
+let _startPromise = null;
+let _startResolvers = [];
+
+// Debounced start — collects all addStream calls within 200ms then starts once
+function scheduleStart() {
+  return new Promise((resolve, reject) => {
+    _startResolvers.push({ resolve, reject });
+    if (_startTimer) clearTimeout(_startTimer);
+    _startTimer = setTimeout(async () => {
+      _startTimer = null;
+      const resolvers = _startResolvers.splice(0);
+      try {
+        await startGo2rtc();
+        resolvers.forEach(r => r.resolve());
+      } catch(e) {
+        resolvers.forEach(r => r.reject(e));
+      }
+    }, 300);
+  });
+}
+
 async function g2rAddStream(name, hlsUrl) {
   activeStreams[name] = hlsUrl;
-  await startGo2rtc();
+  await scheduleStart();
   console.log(`[GO2RTC] Stream added: ${name}`);
 }
 
 async function g2rDeleteStream(name) {
   delete activeStreams[name];
   console.log(`[GO2RTC] Stream removed: ${name}`);
-  // Restart go2rtc without this stream if others still active
   if (Object.keys(activeStreams).length > 0) await startGo2rtc();
-  else if (g2rProc) { g2rProc.kill(); g2rProc = null; }
+  else if (g2rProc) { await killGo2rtc(); }
 }
 
 async function g2rStreamReady(name, retries = 20) {

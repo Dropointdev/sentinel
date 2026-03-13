@@ -232,7 +232,15 @@ function openMSE(id, wsPath) {
       toast(`${id} connected`);
     }
   };
-  ws.onclose = () => { if (S[id]) setStatus(id, 'idle', 'DISCONNECTED'); };
+  ws.onclose = () => {
+    if (!S[id]) return; // manually stopped
+    // go2rtc restarted — retry WS after 1s
+    console.log(`[WS:${id}] closed — retrying in 1s`);
+    setStatus(id, 'loading', 'RECONNECTING...');
+    setTimeout(() => {
+      if (S[id]) openMSE(id, wsPath); // reconnect with same URL
+    }, 1000);
+  };
   ws.onerror = () => { setStatus(id, 'error', '✕ WS ERR'); toast(`${id}: WebSocket error`, true); };
 
   startLatTimer(id);
