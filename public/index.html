@@ -193,7 +193,7 @@ async function connectCam(id) {
 // ── WebSocket + MSE ───────────────────────────────────────────────────────────
 function openWS(id, wsPath) {
   closeWS(id);
-  S[id] = { ws:null, ms:null, sb:null, queue:[], flushing:false, frameCount:0, latTimer:null };
+  S[id] = { ws:null, ms:null, sb:null, queue:[], appending:false, trimming:false, frameCount:0, latTimer:null };
   const s = S[id];
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -224,7 +224,7 @@ function openWS(id, wsPath) {
           setStatus(id, 'loading', 'RECONNECTING...'); spinner(id, true);
         } else if (msg.type === 'reconnected') {
           spinner(id, false); setStatus(id, 'live', '● LIVE');
-          s.queue = []; s.flushing = false; s.frameCount = 0;
+          s.queue = []; s.appending = false; s.trimming = false; s.frameCount = 0;
         } else if (msg.type === 'stream_ended') {
           spinner(id, false); showPH(id);
           setStatus(id, 'idle', 'STREAM ENDED');
@@ -249,31 +249,46 @@ function openWS(id, wsPath) {
   startLatTimer(id);
 }
 
-// ── MSE pipeline ──────────────────────────────────────────────────────────────
+// ── MSE pipeline ─────────────────────────────────────────────────────────────
+// Two separate locks: appending vs trimming — they must never share one flag.
+// onUpdateEnd routes by which op was last started.
+
 function flush(id) {
   const s = S[id];
-  if (!s || s.flushing || !s.sb || s.sb.updating || s.queue.length === 0) return;
-  s.flushing = true;
+  if (!s || s.appending || s.trimming || !s.sb || s.sb.updating || s.queue.length === 0) return;
+  s.appending = true;
   try { s.sb.appendBuffer(s.queue.shift()); }
-  catch(e) { s.flushing = false; if (e.name === 'QuotaExceededError') trim(id); }
+  catch(e) {
+    s.appending = false;
+    if (e.name === 'QuotaExceededError') trim(id);
+  }
 }
 
 function onUpdateEnd(id) {
   const s = S[id]; if (!s) return;
-  s.flushing = false;
-  trim(id);
-  flush(id);
+  if (s.trimming) {
+    // trim just finished — safe to append now
+    s.trimming = false;
+    flush(id);
+  } else {
+    // append just finished — trim old data then queue next append
+    s.appending = false;
+    trim(id);
+    // if trim didn't start (nothing to remove), continue appending
+    if (!s.trimming) flush(id);
+  }
 }
 
 function trim(id) {
-  const s = S[id]; if (!s || !s.sb || s.sb.updating) return;
+  const s = S[id];
+  if (!s || s.trimming || s.appending || !s.sb || s.sb.updating) return;
   const video = document.getElementById(`vid-${id}`);
   if (!video || !s.sb.buffered.length) return;
   const start  = s.sb.buffered.start(0);
   const trimTo = video.currentTime - 1.0;
   if (trimTo > start + 0.5) {
-    try { s.flushing = true; s.sb.remove(start, trimTo); }
-    catch(_) { s.flushing = false; }
+    try { s.trimming = true; s.sb.remove(start, trimTo); }
+    catch(_) { s.trimming = false; }
   }
 }
 
@@ -282,18 +297,32 @@ function startLatTimer(id) {
   stopLatTimer(id);
   const video = document.getElementById(`vid-${id}`);
   const latEl = document.getElementById(`lat-${id}`);
-  const s     = S[id];
 
   S[id].latTimer = setInterval(() => {
     if (!video || !video.buffered.length) return;
-    const end   = video.buffered.end(video.buffered.length - 1);
-    const ms    = Math.round((end - video.currentTime) * 1000);
+    const s   = S[id]; if (!s) return;
+    const end = video.buffered.end(video.buffered.length - 1);
+    const ms  = Math.round((end - video.currentTime) * 1000);
+
     if (latEl) {
       latEl.textContent = ms + 'ms';
       latEl.className   = 'latency ' + (ms < 1000 ? 'good' : ms < 2500 ? 'warn' : 'bad');
     }
-    if (ms > 1500) { video.currentTime = end - 0.2; }
-    if (video.paused && s?.frameCount > 5) video.play().catch(()=>{});
+
+    // Smooth catchup: speed up 10% when 1-2.5s behind
+    if (ms > 2500) {
+      // Too far behind — hard jump to live edge
+      console.log(`[LAT:${id}] ${ms}ms — hard jump`);
+      video.currentTime = end - 0.3;
+      video.playbackRate = 1.0;
+    } else if (ms > 1000) {
+      // Gently speed up to catch live edge without a visual jump
+      video.playbackRate = 1.1;
+    } else {
+      video.playbackRate = 1.0;
+    }
+
+    if (video.paused && s.frameCount > 5) video.play().catch(() => {});
   }, 200);
 }
 
