@@ -44,6 +44,7 @@ function startGo2rtc() {
     const cfg = `
 api:
   listen: "127.0.0.1:1984"
+  origin: "*"
 rtsp:
   disable: true
 webrtc:
@@ -85,12 +86,11 @@ streams: {}
 
 // ── go2rtc stream management ──────────────────────────────────────────────────
 async function g2rAddStream(name, hlsUrl) {
-  // go2rtc ffmpeg source: software transcode HEVC→H264
-  // #video=h264 tells go2rtc to transcode to H264 using ffmpeg
+  // go2rtc ffmpeg source — transcode HEVC→H264
   const src = `ffmpeg:${hlsUrl}#video=h264`;
-  // go2rtc API: PUT /api/streams?name=X  with src as plain text body
-  await axios.put(`${G2R}/api/streams?name=${encodeURIComponent(name)}`, src, {
-    headers: { 'Content-Type': 'text/plain' }
+  // go2rtc API: PUT /api/streams?name=NAME&src=SOURCE (both as query params)
+  await axios.put(`${G2R}/api/streams`, null, {
+    params: { name, src }
   });
   console.log(`[GO2RTC] Stream added: ${name}`);
 }
