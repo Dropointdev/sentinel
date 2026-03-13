@@ -86,15 +86,17 @@ streams: {}
 
 // ── go2rtc stream management ──────────────────────────────────────────────────
 async function g2rAddStream(name, hlsUrl) {
-  // go2rtc ffmpeg source — transcode HEVC→H264
-  const src = `ffmpeg:${hlsUrl}#video=h264`;
-  const url  = `${G2R}/api/streams`;
-  console.log(`[GO2RTC] PUT ${url} name=${name} src=${src.substring(0, 80)}`);
+  // go2rtc PUT /api/streams expects YAML body: "name:\n  - source"
+  const src  = `ffmpeg:${hlsUrl}#video=h264`;
+  const yaml = `${name}:\n  - ${src}`;
+  console.log(`[GO2RTC] Adding stream ${name}`);
   try {
-    const r = await axios.put(url, null, { params: { name, src } });
+    const r = await axios.put(`${G2R}/api/streams`, yaml, {
+      headers: { 'Content-Type': 'text/yaml' }
+    });
     console.log(`[GO2RTC] Stream added: ${name} status=${r.status}`);
   } catch (e) {
-    const body = e.response?.data ? JSON.stringify(e.response.data).substring(0, 200) : e.message;
+    const body = e.response?.data ? String(e.response.data).substring(0, 200) : e.message;
     console.error(`[GO2RTC] Add stream failed: status=${e.response?.status} body=${body}`);
     throw e;
   }
