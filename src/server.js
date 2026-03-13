@@ -35,14 +35,15 @@ console.log('[CONFIG] Cameras:', CAMERAS.map(c => `${c.id}(${c.label})`).join(',
 
 // ── go2rtc process ────────────────────────────────────────────────────────────
 let g2rProc = null;
+const activeStreams = {}; // { deviceId: hlsUrl }
 
-function startGo2rtc() {
-  return new Promise((resolve, reject) => {
-    console.log('[GO2RTC] Starting...');
-
-    // Minimal config — only API + MSE/WebSocket, no RTSP/WebRTC (Render blocks those ports)
-    const cfg = `
-api:
+function writeConfig() {
+  const fs = require('fs');
+  let streamLines = '';
+  for (const [name, hlsUrl] of Object.entries(activeStreams)) {
+    streamLines += `  ${name}:\n    - ffmpeg:${hlsUrl}#video=h264\n`;
+  }
+  const cfg = `api:
   listen: "127.0.0.1:1984"
   origin: "*"
 rtsp:
@@ -53,9 +54,22 @@ log:
   level: error
 ffmpeg:
   bin: ffmpeg
-streams: {}
-`;
-    require('fs').writeFileSync('/tmp/go2rtc.yaml', cfg);
+streams:
+${streamLines || '  {}\n'}`;
+  fs.writeFileSync('/tmp/go2rtc.yaml', cfg);
+  console.log('[GO2RTC] Config written with streams:', Object.keys(activeStreams).join(', ') || 'none');
+}
+
+function startGo2rtc() {
+  return new Promise((resolve, reject) => {
+    // Kill existing process first
+    if (g2rProc) {
+      g2rProc.kill();
+      g2rProc = null;
+    }
+
+    writeConfig();
+    console.log('[GO2RTC] Starting...');
 
     g2rProc = spawn('go2rtc', ['-config', '/tmp/go2rtc.yaml'], {
       stdio: ['ignore', 'pipe', 'pipe']
@@ -86,58 +100,29 @@ streams: {}
 
 // ── go2rtc stream management ──────────────────────────────────────────────────
 async function g2rAddStream(name, hlsUrl) {
-  // go2rtc PUT /api/streams expects YAML body: "name:\n  - source"
-  const src  = `ffmpeg:${hlsUrl}#video=h264`;
-  // Must use real newline — \n literal is ignored by go2rtc YAML parser
-  const yaml = `${name}:
-  - ${src}`;
-  console.log(`[GO2RTC] Adding stream ${name}, yaml:\n${yaml}`);
-  try {
-    const r = await axios.put(`${G2R}/api/streams`, yaml, {
-      headers: { 'Content-Type': 'text/yaml' }
-    });
-    console.log(`[GO2RTC] Stream added: ${name} status=${r.status}`);
-  } catch (e) {
-    const body = e.response?.data ? String(e.response.data).substring(0, 200) : e.message;
-    console.error(`[GO2RTC] Add stream failed: status=${e.response?.status} body=${body}`);
-    throw e;
-  }
+  activeStreams[name] = hlsUrl;
+  await startGo2rtc();
+  console.log(`[GO2RTC] Stream added: ${name}`);
 }
 
 async function g2rDeleteStream(name) {
-  try {
-    await axios.delete(`${G2R}/api/streams`, { params: { name } });
-    console.log(`[GO2RTC] Stream removed: ${name}`);
-  } catch (_) {}
+  delete activeStreams[name];
+  console.log(`[GO2RTC] Stream removed: ${name}`);
+  // Restart go2rtc without this stream if others still active
+  if (Object.keys(activeStreams).length > 0) await startGo2rtc();
+  else if (g2rProc) { g2rProc.kill(); g2rProc = null; }
 }
 
-async function g2rStreamReady(name, retries = 30) {
-  // Poll go2rtc until stream is active
-  // go2rtc stream states: producers array may not exist until FFmpeg connects
+async function g2rStreamReady(name, retries = 20) {
   for (let i = 0; i < retries; i++) {
     try {
       const r = await axios.get(`${G2R}/api/streams`, { timeout: 3000 });
       const s = r.data?.[name];
-      // Log structure on first few attempts so we know what go2rtc returns
-      if (i < 3) console.log(`[GO2RTC] Stream state (${i+1}):`, JSON.stringify(r.data).substring(0, 400));
-      // go2rtc marks a stream ready when it has producers OR when it has the stream entry at all
-      // Different versions use different fields — check multiple
-      if (s && (
-        (s.producers?.length > 0) ||
-        (s.tracks?.length > 0) ||
-        (s.status === 'active') ||
-        (Array.isArray(s) && s.length > 0)
-      )) return true;
-    } catch (e) {
-      console.log(`[GO2RTC] Poll error:`, e.message);
-    }
+      if (i === 0) console.log(`[GO2RTC] Streams:`, JSON.stringify(r.data).substring(0, 300));
+      if (s?.producers?.length > 0 || s?.tracks?.length > 0) return true;
+    } catch (_) {}
     await sleep(1000);
   }
-  // Log final state before giving up
-  try {
-    const r = await axios.get(`${G2R}/api/streams`, { timeout: 3000 });
-    console.log('[GO2RTC] Final state:', JSON.stringify(r.data).substring(0, 400));
-  } catch (_) {}
   return false;
 }
 
