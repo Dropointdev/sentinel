@@ -47,11 +47,11 @@ function writeConfig() {
   listen: "127.0.0.1:1984"
   origin: "*"
 rtsp:
-  disable: true
+  listen: ""
 webrtc:
-  disable: true
+  listen: ""
 log:
-  level: error
+  level: warn
 ffmpeg:
   bin: ffmpeg
 streams:
@@ -60,13 +60,20 @@ ${streamLines || '  {}\n'}`;
   console.log('[GO2RTC] Config written with streams:', Object.keys(activeStreams).join(', ') || 'none');
 }
 
+function killGo2rtc() {
+  return new Promise(resolve => {
+    if (!g2rProc) return resolve();
+    const p = g2rProc;
+    g2rProc = null;
+    p.once('close', () => { setTimeout(resolve, 300); }); // 300ms after exit for port release
+    p.kill('SIGTERM');
+    setTimeout(() => { try { p.kill('SIGKILL'); } catch(_){} }, 2000);
+  });
+}
+
 function startGo2rtc() {
-  return new Promise((resolve, reject) => {
-    // Kill existing process first
-    if (g2rProc) {
-      g2rProc.kill();
-      g2rProc = null;
-    }
+  return new Promise(async (resolve, reject) => {
+    await killGo2rtc();  // Wait for old process to fully exit + ports to release
 
     writeConfig();
     console.log('[GO2RTC] Starting...');
