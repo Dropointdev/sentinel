@@ -6,7 +6,7 @@ const http    = require('http');
 const axios   = require('axios');
 const { WebSocketServer } = require('ws');
 const { request }   = require('./imouclient');
-const StreamManager = require('./streammanager');
+const StreamManager = require('./StreamManager');
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
