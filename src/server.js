@@ -110,7 +110,7 @@ async function g2rStreamReady(name, retries = 30) {
       const r = await axios.get(`${G2R}/api/streams`, { timeout: 3000 });
       const s = r.data?.[name];
       // Log structure on first few attempts so we know what go2rtc returns
-      if (i < 3) console.log(`[GO2RTC] Stream state (${i+1}):`, JSON.stringify(s).substring(0, 200));
+      if (i < 3) console.log(`[GO2RTC] Stream state (${i+1}):`, JSON.stringify(r.data).substring(0, 400));
       // go2rtc marks a stream ready when it has producers OR when it has the stream entry at all
       // Different versions use different fields — check multiple
       if (s && (
@@ -127,25 +127,24 @@ async function g2rStreamReady(name, retries = 30) {
   // Log final state before giving up
   try {
     const r = await axios.get(`${G2R}/api/streams`, { timeout: 3000 });
-    console.log('[GO2RTC] Final stream state:', JSON.stringify(r.data?.[name]).substring(0, 300));
+    console.log('[GO2RTC] Final state:', JSON.stringify(r.data).substring(0, 400));
   } catch (_) {}
   return false;
 }
 
-// ── Proxy go2rtc WebSocket + stream endpoints to browser ─────────────────────
-// Browser connects to /go2rtc/* which we forward to go2rtc at 127.0.0.1:1984
-app.use('/go2rtc', createProxyMiddleware({
+// ── Proxy go2rtc HTTP endpoints ───────────────────────────────────────────────
+const g2rProxy = createProxyMiddleware({
   target: G2R,
   changeOrigin: true,
   pathRewrite: { '^/go2rtc': '' },
-  ws: true,
   on: {
     error: (err, req, res) => {
       console.error('[PROXY] go2rtc proxy error:', err.message);
-      if (res?.writeHead) res.status(502).json({ error: 'go2rtc unavailable' });
+      if (res?.writeHead) try { res.status(502).json({ error: 'go2rtc unavailable' }); } catch(_) {}
     }
   }
-}));
+});
+app.use('/go2rtc', g2rProxy);
 
 // ── IMOU helpers ──────────────────────────────────────────────────────────────
 async function unbindCurrent(deviceId) {
@@ -291,10 +290,12 @@ process.on('SIGTERM', () => { if (g2rProc) g2rProc.kill(); process.exit(); });
     console.log(`   go2rtc  : ${G2R}\n`);
   });
 
-  // Forward WebSocket upgrade requests to go2rtc proxy
+  // Forward WebSocket upgrades for /go2rtc/* to go2rtc
   server.on('upgrade', (req, socket, head) => {
     if (req.url?.startsWith('/go2rtc')) {
-      // handled by http-proxy-middleware
+      // Rewrite path: /go2rtc/api/ws?src=X  →  /api/ws?src=X
+      req.url = req.url.replace(/^\/go2rtc/, '');
+      g2rProxy.upgrade(req, socket, head);
     }
   });
 })();
