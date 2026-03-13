@@ -196,37 +196,50 @@ function openMSE(id, wsPath) {
   ws.binaryType = 'arraybuffer';
   state.ws = ws;
 
-  const mime = ['video/mp4; codecs="avc1.640028"', 'video/mp4; codecs="avc1.42E028"', 'video/mp4']
-    .find(m => MediaSource.isTypeSupported(m)) || 'video/mp4';
-
-  const ms  = new MediaSource();
-  state.ms  = ms;
   const vid = document.getElementById(`vid-${id}`);
-  vid.src   = URL.createObjectURL(ms);
 
-  ms.addEventListener('sourceopen', () => {
-    try {
-      const sb  = ms.addSourceBuffer(mime);
-      state.sb  = sb;
-      sb.mode   = 'segments';
-      sb.addEventListener('updateend', () => {
-        state.flushing = false;
-        trimBuffer(id);
-        flushQueue(id);
-      });
-    } catch (e) { toast('MSE init error: ' + e.message, true); }
-  });
+  function initMSE(codec) {
+    const ms = new MediaSource();
+    state.ms = ms;
+    vid.src  = URL.createObjectURL(ms);
+    ms.addEventListener('sourceopen', () => {
+      try {
+        const sb = ms.addSourceBuffer(codec);
+        state.sb = sb;
+        sb.mode  = 'segments';
+        sb.addEventListener('updateend', () => {
+          state.flushing = false;
+          trimBuffer(id);
+          flushQueue(id);
+        });
+        console.log(`[WS:${id}] SourceBuffer ready with codec: ${codec}`);
+      } catch (e) { toast('MSE init error: ' + e.message, true); }
+    });
+  }
 
   ws.onopen = () => {
     console.log(`[WS:${id}] go2rtc connected — sending MSE handshake`);
-    // go2rtc MSE protocol: send codec as a single string, not array
+    // go2rtc protocol: send supported codec, go2rtc responds with confirmed codec then streams fMP4
     const codec = ['video/mp4; codecs="avc1.640029"', 'video/mp4; codecs="avc1.42E028"', 'video/mp4']
       .find(m => MediaSource.isTypeSupported(m)) || 'video/mp4';
-    console.log(`[WS:${id}] sending handshake codec:`, codec);
     ws.send(JSON.stringify({ type: 'mse', value: codec }));
   };
+
   ws.onmessage = e => {
-    if (typeof e.data === 'string') return; // go2rtc sends text pings — ignore
+    // go2rtc sends a JSON response first confirming the codec, then binary fMP4
+    if (typeof e.data === 'string') {
+      try {
+        const msg = JSON.parse(e.data);
+        console.log(`[WS:${id}] go2rtc msg:`, msg);
+        if (msg.type === 'mse' && msg.value) {
+          // go2rtc confirmed codec — now init MSE with the confirmed codec
+          initMSE(msg.value);
+        }
+      } catch (_) {}
+      return;
+    }
+
+    // Binary fMP4 data
     state.queue.push(e.data);
     while (state.queue.length > 2) state.queue.shift();
     flushQueue(id);
@@ -239,14 +252,12 @@ function openMSE(id, wsPath) {
       toast(`${id} connected`);
     }
   };
+
   ws.onclose = () => {
-    if (!S[id]) return; // manually stopped
-    // go2rtc restarted — retry WS after 1s
-    console.log(`[WS:${id}] closed — retrying in 1s`);
+    if (!S[id]) return;
+    console.log(`[WS:${id}] closed — retrying in 1.5s`);
     setStatus(id, 'loading', 'RECONNECTING...');
-    setTimeout(() => {
-      if (S[id]) openMSE(id, wsPath); // reconnect with same URL
-    }, 1000);
+    setTimeout(() => { if (S[id]) openMSE(id, wsPath); }, 1500);
   };
   ws.onerror = () => { setStatus(id, 'error', '✕ WS ERR'); toast(`${id}: WebSocket error`, true); };
 
