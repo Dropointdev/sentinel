@@ -39,11 +39,8 @@ let g2rProc = null;
 
 function writeGo2rtcConfig(cameraIds) {
   const fs = require('fs');
-  let streamLines = '';
-  for (const id of cameraIds) {
-    // go2rtc reads from our FFmpeg output via RTSP
-    streamLines += `  ${id}:\n    - rtsp://127.0.0.1:8554/${id}\n`;
-  }
+  // No source — go2rtc waits for FFmpeg to RTSP PUBLISH/ANNOUNCE to it
+  let streamLines = cameraIds.map(id => `  ${id}: []\n`).join('');
   const cfg = `api:
   listen: "127.0.0.1:1984"
   origin: "*"
@@ -122,7 +119,7 @@ function startFFmpeg(deviceId, hlsUrl) {
     '-preset', 'ultrafast',
     '-tune', 'zerolatency',
     '-profile:v', 'baseline',
-    '-level', '3.1',
+    '-level', '4.2',
     '-b:v', '1000k',
     '-maxrate', '1200k',
     '-bufsize', '500k',
