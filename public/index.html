@@ -109,7 +109,7 @@
 
 <script>
 let cameras = [], currentQuality = 'HD', currentLayout = 'grid';
-const S = {}; // per-cam state: { ms, sb, ws, queue, flushing, frameCount, latTimer }
+const S = {}; // per-cam state
 
 setInterval(() => {
   const t = new Date().toLocaleTimeString('en-GB', { hour12: false });
@@ -117,6 +117,7 @@ setInterval(() => {
   document.querySelectorAll('.cam-ts').forEach(e => e.textContent = t);
 }, 1000);
 
+// ── Init ──────────────────────────────────────────────────────────────────────
 async function init() {
   try {
     const r = await fetch('/api/cameras');
@@ -133,6 +134,7 @@ async function init() {
   } catch (e) { setFooter('INIT FAILED — ' + e.message); }
 }
 
+// ── Grid ──────────────────────────────────────────────────────────────────────
 function buildGrid() {
   const n    = cameras.length;
   const grid = document.getElementById('grid');
@@ -145,20 +147,29 @@ function cardHTML({ id, label }) {
     <div class="vwrap">
       <video id="vid-${id}" muted playsinline></video>
       <div class="ph" id="ph-${id}">
-        <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#00e5ff" stroke-width="1"><path d="M15 10l4.553-2.277A1 1 0 0121 8.723v6.554a1 1 0 01-1.447.894L15 14M3 8a2 2 0 012-2h10a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"/></svg>
+        <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#00e5ff" stroke-width="1">
+          <path d="M15 10l4.553-2.277A1 1 0 0121 8.723v6.554a1 1 0 01-1.447.894L15 14M3 8a2 2 0 012-2h10a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"/>
+        </svg>
         <p>${label}<br><span style="font-size:8px;opacity:.5">${id}</span></p>
         <button class="ph-btn" onclick="connectCam('${id}')">▶ CONNECT</button>
       </div>
       <div class="spin" id="spin-${id}"><div class="ring"></div></div>
       <div class="hud">
-        <div class="hud-top"><div class="tag id">${label}</div><div class="tag idle" id="st-${id}">NO SIGNAL</div></div>
-        <div class="hud-bot"><div class="cam-name">${label}</div><div class="cam-ts">--:--:--</div></div>
+        <div class="hud-top">
+          <div class="tag id">${label}</div>
+          <div class="tag idle" id="st-${id}">NO SIGNAL</div>
+        </div>
+        <div class="hud-bot">
+          <div class="cam-name">${label}</div>
+          <div class="cam-ts">--:--:--</div>
+        </div>
       </div>
     </div>
     <div class="card-foot">
       <div class="devid">${id}</div>
       <div class="card-acts">
         <span class="latency good" id="lat-${id}">--ms</span>
+        <button class="ibtn" id="mute-${id}" onclick="toggleMute('${id}')">UNMUTE</button>
         <button class="ibtn" onclick="fullscreen('${id}')">FULL</button>
         <button class="ibtn red" onclick="stopCam('${id}')">STOP</button>
       </div>
@@ -166,6 +177,7 @@ function cardHTML({ id, label }) {
   </div>`;
 }
 
+// ── Connect ───────────────────────────────────────────────────────────────────
 function connectAll() { cameras.forEach(c => connectCam(c.id)); }
 function stopAll()    { cameras.forEach(c => stopCam(c.id)); }
 
@@ -175,6 +187,7 @@ async function connectCam(id) {
     const r = await fetch(`/api/stream/${id}?quality=${currentQuality}`);
     const j = await r.json();
     if (!j.success) throw new Error(j.error || 'Failed');
+    console.log(`[${id}] Got wsUrl:`, j.wsUrl);
     openMSE(id, j.wsUrl);
   } catch (e) {
     spinner(id, false); showPH(id);
@@ -184,11 +197,15 @@ async function connectCam(id) {
 }
 
 // ── go2rtc MSE via WebSocket ──────────────────────────────────────────────────
-// go2rtc sends fMP4 over WebSocket natively — same MSE pipeline but managed by go2rtc
 function openMSE(id, wsPath) {
   closeMSE(id);
 
-  const state = { ms: null, sb: null, ws: null, queue: [], flushing: false, frameCount: 0, latTimer: null };
+  const state = {
+    ms: null, sb: null, ws: null,
+    queue: [], flushing: false,
+    frameCount: 0, latTimer: null,
+    codec: null
+  };
   S[id] = state;
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -199,9 +216,13 @@ function openMSE(id, wsPath) {
   const vid = document.getElementById(`vid-${id}`);
 
   function initMSE(codec) {
+    state.codec = codec;
+    console.log(`[${id}] Initialising MSE with codec: ${codec}`);
+
     const ms = new MediaSource();
     state.ms = ms;
     vid.src  = URL.createObjectURL(ms);
+
     ms.addEventListener('sourceopen', () => {
       try {
         const sb = ms.addSourceBuffer(codec);
@@ -212,80 +233,116 @@ function openMSE(id, wsPath) {
           trimBuffer(id);
           flushQueue(id);
         });
-        console.log(`[WS:${id}] SourceBuffer ready with codec: ${codec}`);
-      } catch (e) { toast('MSE init error: ' + e.message, true); }
+        sb.addEventListener('error', e => {
+          console.error(`[${id}] SourceBuffer error:`, e);
+          toast(`${id}: buffer error — reconnecting`, true);
+          setTimeout(() => { if (S[id]) openMSE(id, wsPath); }, 2000);
+        });
+        console.log(`[${id}] SourceBuffer ready`);
+        // Flush anything queued before sourceopen fired
+        flushQueue(id);
+      } catch (e) {
+        console.error(`[${id}] MSE addSourceBuffer error:`, e.message);
+        toast(`${id}: codec error — ${e.message}`, true);
+      }
     });
   }
 
   ws.onopen = () => {
-    console.log(`[WS:${id}] go2rtc connected — sending MSE handshake`);
-    // go2rtc protocol: send supported codec, go2rtc responds with confirmed codec then streams fMP4
-    const codec = ['video/mp4; codecs="avc1.640029"', 'video/mp4; codecs="avc1.42E028"', 'video/mp4']
-      .find(m => MediaSource.isTypeSupported(m)) || 'video/mp4';
-    ws.send(JSON.stringify({ type: 'mse', value: codec }));
+    console.log(`[${id}] WebSocket connected — sending MSE handshake`);
+    // Try video+audio codec first, fallback to video only
+    // go2rtc will confirm what it can provide
+    const preferred = [
+      'video/mp4; codecs="avc1.640029,mp4a.40.2"',
+      'video/mp4; codecs="avc1.42E028,mp4a.40.2"',
+      'video/mp4; codecs="avc1.640029"',
+      'video/mp4'
+    ].find(m => {
+      try { return MediaSource.isTypeSupported(m); } catch(_) { return false; }
+    }) || 'video/mp4';
+
+    console.log(`[${id}] Preferred codec:`, preferred);
+    ws.send(JSON.stringify({ type: 'mse', value: preferred }));
   };
 
   ws.onmessage = e => {
-    // go2rtc sends a JSON response first confirming the codec, then binary fMP4
     if (typeof e.data === 'string') {
       try {
         const msg = JSON.parse(e.data);
-        console.log(`[WS:${id}] go2rtc msg:`, msg);
+        console.log(`[${id}] go2rtc msg:`, msg);
         if (msg.type === 'mse' && msg.value) {
-          // go2rtc confirmed codec — now init MSE with the confirmed codec
+          // go2rtc confirmed the codec — initialise MSE now
           initMSE(msg.value);
+        } else if (msg.type === 'error') {
+          console.error(`[${id}] go2rtc error:`, msg.value);
+          toast(`${id}: ${msg.value}`, true);
         }
       } catch (_) {}
       return;
     }
 
-    // Binary fMP4 data
+    // Binary fMP4 data — queue it
     state.queue.push(e.data);
-    while (state.queue.length > 2) state.queue.shift();
+    // Keep buffer small — drop old frames if backing up
+    while (state.queue.length > 3) state.queue.shift();
     flushQueue(id);
 
     state.frameCount++;
-    if (state.frameCount === 1) vid.play().catch(() => {});
-    if (state.frameCount === 3) {
+    if (state.frameCount === 1) {
+      vid.play().catch(err => console.warn(`[${id}] Autoplay blocked:`, err.message));
+    }
+    if (state.frameCount === 5) {
       spinner(id, false);
       setStatus(id, 'live', '● LIVE');
       toast(`${id} connected`);
     }
   };
 
-  ws.onclose = () => {
-    if (!S[id]) return;
-    console.log(`[WS:${id}] closed — retrying in 1.5s`);
+  ws.onclose = e => {
+    if (!S[id]) return; // intentionally closed
+    console.log(`[${id}] WS closed (${e.code}) — reconnecting in 2s`);
     setStatus(id, 'loading', 'RECONNECTING...');
-    setTimeout(() => { if (S[id]) openMSE(id, wsPath); }, 1500);
+    setTimeout(() => { if (S[id]) openMSE(id, wsPath); }, 2000);
   };
-  ws.onerror = () => { setStatus(id, 'error', '✕ WS ERR'); toast(`${id}: WebSocket error`, true); };
 
-  startLatTimer(id);
+  ws.onerror = err => {
+    console.error(`[${id}] WS error:`, err);
+    setStatus(id, 'error', '✕ WS ERR');
+    toast(`${id}: WebSocket error`, true);
+  };
+
+  startLatTimer(id, vid);
 }
 
+// ── Buffer management ─────────────────────────────────────────────────────────
 function flushQueue(id) {
   const s = S[id];
   if (!s || s.flushing || !s.sb || s.sb.updating || !s.queue.length) return;
   s.flushing = true;
-  try { s.sb.appendBuffer(s.queue.shift()); }
-  catch (e) { s.flushing = false; if (e.name === 'QuotaExceededError') trimBuffer(id); }
+  try {
+    s.sb.appendBuffer(s.queue.shift());
+  } catch (e) {
+    s.flushing = false;
+    if (e.name === 'QuotaExceededError') trimBuffer(id);
+    else console.warn(`[${id}] appendBuffer error:`, e.message);
+  }
 }
 
 function trimBuffer(id) {
   const s   = S[id]; if (!s || !s.sb || s.sb.updating) return;
-  const vid = document.getElementById(`vid-${id}`); if (!vid || !s.sb.buffered.length) return;
+  const vid = document.getElementById(`vid-${id}`);
+  if (!vid || !s.sb.buffered.length) return;
   const start  = s.sb.buffered.start(0);
-  const trimTo = vid.currentTime - 1.0;
+  const trimTo = vid.currentTime - 1.5;
   if (trimTo > start + 0.5) {
     try { s.flushing = true; s.sb.remove(start, trimTo); }
     catch (_) { s.flushing = false; }
   }
 }
 
-function startLatTimer(id) {
+// ── Latency monitor ───────────────────────────────────────────────────────────
+function startLatTimer(id, vid) {
   stopLatTimer(id);
-  const vid   = document.getElementById(`vid-${id}`);
   const latEl = document.getElementById(`lat-${id}`);
   S[id].latTimer = setInterval(() => {
     if (!vid?.buffered.length) return;
@@ -295,19 +352,28 @@ function startLatTimer(id) {
       latEl.textContent = ms + 'ms';
       latEl.className   = 'latency ' + (ms < 1000 ? 'good' : ms < 2500 ? 'warn' : 'bad');
     }
-    if (ms > 1500) vid.currentTime = end - 0.2;
+    // Catchup if buffer drifts beyond 1.5s
+    if (ms > 1500 && !vid.paused) {
+      console.log(`[${id}] Buffer drift ${ms}ms — skipping to live`);
+      vid.currentTime = end - 0.1;
+    }
+    // Resume if stalled
     if (vid.paused && S[id]?.frameCount > 5) vid.play().catch(() => {});
-  }, 200);
+  }, 500);
 }
 
 function stopLatTimer(id) {
   if (S[id]?.latTimer) { clearInterval(S[id].latTimer); S[id].latTimer = null; }
 }
 
+// ── Stop / Close ──────────────────────────────────────────────────────────────
 function closeMSE(id) {
   stopLatTimer(id);
   const s = S[id];
-  if (s?.ws) { s.ws.close(); s.ws = null; }
+  if (s?.ws) { s.ws.onclose = null; s.ws.close(); }
+  if (s?.ms && s.ms.readyState === 'open') {
+    try { s.ms.endOfStream(); } catch(_) {}
+  }
   delete S[id];
 }
 
@@ -315,11 +381,21 @@ function stopCam(id) {
   closeMSE(id);
   const vid = document.getElementById(`vid-${id}`);
   if (vid) { vid.pause(); vid.src = ''; }
-  showPH(id); setStatus(id, 'idle', 'NO SIGNAL');
+  showPH(id);
+  setStatus(id, 'idle', 'NO SIGNAL');
   const l = document.getElementById(`lat-${id}`);
   if (l) { l.textContent = '--ms'; l.className = 'latency good'; }
   fetch(`/api/stream/${id}/stop`, { method: 'POST' }).catch(() => {});
   toast(`${id} disconnected`);
+}
+
+// ── Controls ──────────────────────────────────────────────────────────────────
+function toggleMute(id) {
+  const vid = document.getElementById(`vid-${id}`);
+  const btn = document.getElementById(`mute-${id}`);
+  if (!vid || !btn) return;
+  vid.muted = !vid.muted;
+  btn.textContent = vid.muted ? 'UNMUTE' : 'MUTE';
 }
 
 function setLayout(l) {
@@ -328,26 +404,29 @@ function setLayout(l) {
   document.getElementById('l-solo').classList.toggle('active', l === 'solo');
   document.getElementById('grid').className = l === 'solo' ? 'grid l1' : `grid l${Math.min(cameras.length, 5)}`;
 }
+
 function setQuality(q) {
   currentQuality = q;
   document.getElementById('q-hd').classList.toggle('active', q === 'HD');
   document.getElementById('q-sd').classList.toggle('active', q === 'SD');
   cameras.filter(c => S[c.id]?.ws).forEach(c => { stopCam(c.id); setTimeout(() => connectCam(c.id), 300); });
 }
+
 function fullscreen(id) {
   const el = document.getElementById(`card-${id}`);
   if (!document.fullscreenElement) el.requestFullscreen();
   else document.exitFullscreen();
 }
 
+// ── UI Helpers ────────────────────────────────────────────────────────────────
 function setStatus(id, type, text) {
   const el = document.getElementById(`st-${id}`);
   if (el) { el.className = `tag ${type}`; el.textContent = text; }
 }
 function spinner(id, on) { document.getElementById(`spin-${id}`)?.classList.toggle('on', on); }
-function showPH(id) { const e = document.getElementById(`ph-${id}`); if (e) e.style.display = 'flex'; }
-function hidePH(id) { const e = document.getElementById(`ph-${id}`); if (e) e.style.display = 'none'; }
-function setFooter(m) { document.getElementById('fmsg').textContent = m; }
+function showPH(id)  { const e = document.getElementById(`ph-${id}`);  if (e) e.style.display = 'flex'; }
+function hidePH(id)  { const e = document.getElementById(`ph-${id}`);  if (e) e.style.display = 'none'; }
+function setFooter(m){ document.getElementById('fmsg').textContent = m; }
 function toast(msg, isErr = false) {
   const t = document.getElementById('toast');
   t.textContent = msg; t.className = 'show' + (isErr ? ' err' : '');

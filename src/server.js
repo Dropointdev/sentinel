@@ -3,7 +3,6 @@ const express    = require('express');
 const cors       = require('cors');
 const path       = require('path');
 const http       = require('http');
-const https      = require('https');
 const axios      = require('axios');
 const { spawn }  = require('child_process');
 const { createProxyMiddleware } = require('http-proxy-middleware');
@@ -14,10 +13,13 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const app    = express();
 const server = http.createServer(app);
 const PORT   = process.env.PORT || 4000;
-const G2R    = 'http://127.0.0.1:1984'; // go2rtc internal address
+const G2R    = 'http://127.0.0.1:1984';
 
 app.use(cors());
-app.use(express.json());
+app.use((req, res, next) => {
+  if (req.path === '/whep') return next();
+  express.json()(req, res, next);
+});
 
 // ── Camera config ─────────────────────────────────────────────────────────────
 function parseCameras() {
@@ -35,13 +37,14 @@ console.log('[CONFIG] Cameras:', CAMERAS.map(c => `${c.id}(${c.label})`).join(',
 
 // ── go2rtc process ────────────────────────────────────────────────────────────
 let g2rProc = null;
-const activeStreams = {}; // { deviceId: hlsUrl }
+const activeStreams = {};
 
 function writeConfig() {
   const fs = require('fs');
   let streamLines = '';
   for (const [name, hlsUrl] of Object.entries(activeStreams)) {
-    streamLines += `  ${name}:\n    - ffmpeg:${hlsUrl}#video=h264\n`;
+    // Include both video (h264) and audio (aac) so MSE gets both tracks
+    streamLines += `  ${name}:\n    - ffmpeg:${hlsUrl}#video=h264&audio=aac\n`;
   }
   const cfg = `api:
   listen: "127.0.0.1:1984"
@@ -65,7 +68,7 @@ function killGo2rtc() {
     if (!g2rProc) return resolve();
     const p = g2rProc;
     g2rProc = null;
-    p.once('close', () => { setTimeout(resolve, 300); }); // 300ms after exit for port release
+    p.once('close', () => { setTimeout(resolve, 300); });
     p.kill('SIGTERM');
     setTimeout(() => { try { p.kill('SIGKILL'); } catch(_){} }, 2000);
   });
@@ -73,8 +76,7 @@ function killGo2rtc() {
 
 function startGo2rtc() {
   return new Promise(async (resolve, reject) => {
-    await killGo2rtc();  // Wait for old process to fully exit + ports to release
-
+    await killGo2rtc();
     writeConfig();
     console.log('[GO2RTC] Starting...');
 
@@ -89,7 +91,6 @@ function startGo2rtc() {
       g2rProc = null;
     });
 
-    // Wait for go2rtc API to be ready
     let attempts = 0;
     const check = setInterval(async () => {
       attempts++;
@@ -107,10 +108,8 @@ function startGo2rtc() {
 
 // ── go2rtc stream management ──────────────────────────────────────────────────
 let _startTimer = null;
-let _startPromise = null;
 let _startResolvers = [];
 
-// Debounced start — collects all addStream calls within 200ms then starts once
 function scheduleStart() {
   return new Promise((resolve, reject) => {
     _startResolvers.push({ resolve, reject });
@@ -154,10 +153,11 @@ async function g2rStreamReady(name, retries = 20) {
   return false;
 }
 
-// ── Proxy go2rtc HTTP endpoints ───────────────────────────────────────────────
+// ── Proxy go2rtc HTTP + WebSocket ─────────────────────────────────────────────
 const g2rProxy = createProxyMiddleware({
   target: G2R,
   changeOrigin: true,
+  ws: true,
   pathRewrite: { '^/go2rtc': '' },
   on: {
     error: (err, req, res) => {
@@ -217,14 +217,11 @@ app.get('/api/stream/:deviceId', async (req, res) => {
   lock.connecting = true;
 
   try {
-    // Remove any existing go2rtc stream for this device
     await g2rDeleteStream(deviceId);
 
-    // Unbind stale IMOU session
     const hadSession = await unbindCurrent(deviceId);
     if (hadSession) { await sleep(3000); }
 
-    // Get fresh HLS URL from IMOU
     const chosen = await bindAndGetUrl(deviceId, streamId);
     const { ok, body } = await fetchPlaylist(chosen.hls);
     console.log(`[STREAM:${deviceId}] Playlist:`, body.substring(0, 120).replace(/\n/g, ' | '));
@@ -234,20 +231,16 @@ app.get('/api/stream/:deviceId', async (req, res) => {
       return res.status(502).json({ error: 'Camera not ready — wait 15s and try again' });
     }
 
-    // Register stream in go2rtc — it will spawn FFmpeg internally
     await g2rAddStream(deviceId, chosen.hls);
 
-    // Wait for go2rtc to connect to source — but don't block the response
-    // go2rtc buffers clients until FFmpeg is ready, so we can return the URL immediately
     g2rStreamReady(deviceId).then(ready => {
       if (!ready) console.log(`[GO2RTC] Warning: stream ${deviceId} never showed producers`);
     });
 
-    // Return the WebSocket URL straight away — go2rtc handles the wait internally
     res.json({
       success: true,
-      wsUrl:   `/go2rtc/api/ws?src=${deviceId}`,
-      mseUrl:  `/go2rtc/api/stream.mp4?src=${deviceId}`,
+      wsUrl:  `/go2rtc/api/ws?src=${deviceId}`,
+      mseUrl: `/go2rtc/api/stream.mp4?src=${deviceId}`,
     });
   } catch (err) {
     console.error(`[STREAM ERROR:${deviceId}]:`, err.message);
@@ -289,7 +282,13 @@ app.get('/api/device/:deviceId/online', async (req, res) => {
 app.get('/api/health', async (req, res) => {
   let g2rStreams = {};
   try { g2rStreams = (await axios.get(`${G2R}/api/streams`, { timeout: 1000 })).data; } catch (_) {}
-  res.json({ status: 'ok', cameras: CAMERAS.length, go2rtc: !!g2rProc, streams: Object.keys(g2rStreams), time: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    cameras: CAMERAS.length,
+    go2rtc: !!g2rProc,
+    streams: Object.keys(g2rStreams),
+    time: new Date().toISOString()
+  });
 });
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, '..', 'public', 'index.html')));
@@ -312,10 +311,9 @@ process.on('SIGTERM', () => { if (g2rProc) g2rProc.kill(); process.exit(); });
     console.log(`   go2rtc  : ${G2R}\n`);
   });
 
-  // Forward WebSocket upgrades for /go2rtc/* to go2rtc
+  // Forward WebSocket upgrades to go2rtc
   server.on('upgrade', (req, socket, head) => {
     if (req.url?.startsWith('/go2rtc')) {
-      // Rewrite path: /go2rtc/api/ws?src=X  →  /api/ws?src=X
       req.url = req.url.replace(/^\/go2rtc/, '');
       g2rProxy.upgrade(req, socket, head);
     }
