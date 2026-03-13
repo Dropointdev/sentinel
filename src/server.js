@@ -88,8 +88,10 @@ streams: {}
 async function g2rAddStream(name, hlsUrl) {
   // go2rtc PUT /api/streams expects YAML body: "name:\n  - source"
   const src  = `ffmpeg:${hlsUrl}#video=h264`;
-  const yaml = `${name}:\n  - ${src}`;
-  console.log(`[GO2RTC] Adding stream ${name}`);
+  // Must use real newline — \n literal is ignored by go2rtc YAML parser
+  const yaml = `${name}:
+  - ${src}`;
+  console.log(`[GO2RTC] Adding stream ${name}, yaml:\n${yaml}`);
   try {
     const r = await axios.put(`${G2R}/api/streams`, yaml, {
       headers: { 'Content-Type': 'text/yaml' }
