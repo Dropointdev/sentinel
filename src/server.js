@@ -1,24 +1,25 @@
 require('dotenv').config();
-const express    = require('express');
-const cors       = require('cors');
-const path       = require('path');
-const http       = require('http');
-const axios      = require('axios');
-const { spawn }  = require('child_process');
-const { createProxyMiddleware } = require('http-proxy-middleware');
-const { request } = require('./imouclient');
+const express = require('express');
+const cors    = require('cors');
+const path    = require('path');
+const http    = require('http');
+const axios   = require('axios');
+const { WebSocketServer } = require('ws');
+const { request }   = require('./imouclient');
+const StreamManager = require('./StreamManager');
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 const app    = express();
 const server = http.createServer(app);
 const PORT   = process.env.PORT || 4000;
-const G2R    = 'http://127.0.0.1:1984';
 
 app.use(cors());
 app.use(express.json());
 
 // ── Camera config ─────────────────────────────────────────────────────────────
+// CAMERAS env var: "deviceId1:Label 1,deviceId2:Label 2"
+// Falls back to legacy IMOU_DEVICE_ID for single-camera setups
 function parseCameras() {
   if (process.env.CAMERAS) {
     return process.env.CAMERAS.split(',').map(entry => {
@@ -26,175 +27,126 @@ function parseCameras() {
       return { id: id.trim(), label: rest.join(':').trim() || id.trim() };
     });
   }
-  if (process.env.IMOU_DEVICE_ID) return [{ id: process.env.IMOU_DEVICE_ID, label: 'CAM-01' }];
+  if (process.env.IMOU_DEVICE_ID) {
+    return [{ id: process.env.IMOU_DEVICE_ID, label: 'CAM-01' }];
+  }
   return [];
 }
 const CAMERAS = parseCameras();
 console.log('[CONFIG] Cameras:', CAMERAS.map(c => `${c.id}(${c.label})`).join(', '));
 
-// ── go2rtc process ────────────────────────────────────────────────────────────
-// go2rtc only serves MSE — it reads from our FFmpeg via RTSP
-// We run FFmpeg ourselves so we control codec/transcode args
-let g2rProc = null;
+// ── Stream manager ────────────────────────────────────────────────────────────
+const mgr = new StreamManager();
 
-function writeGo2rtcConfig(cameraIds) {
-  const fs = require('fs');
-  // No source — go2rtc waits for FFmpeg to RTSP PUBLISH/ANNOUNCE to it
-  let streamLines = cameraIds.map(id => `  ${id}: []\n`).join('');
-  const cfg = `api:
-  listen: "127.0.0.1:1984"
-  origin: "*"
-rtsp:
-  listen: "127.0.0.1:8554"
-webrtc:
-  listen: ""
-log:
-  level: warn
-streams:
-${streamLines || '  {}\n'}`;
-  fs.writeFileSync('/tmp/go2rtc.yaml', cfg);
-  console.log('[GO2RTC] Config written for:', cameraIds.join(', ') || 'none');
+// Per-device state: lock + active quality
+const deviceState = {};  // { [deviceId]: { lock, quality, reconnecting } }
+function getState(id) {
+  if (!deviceState[id]) deviceState[id] = { lock: false, quality: 0, reconnecting: false };
+  return deviceState[id];
 }
 
-function killGo2rtc() {
-  return new Promise(resolve => {
-    if (!g2rProc) return resolve();
-    const p = g2rProc; g2rProc = null;
-    p.once('close', () => setTimeout(resolve, 200));
-    p.kill('SIGTERM');
-    setTimeout(() => { try { p.kill('SIGKILL'); } catch(_){} }, 2000);
-  });
+// ── WebSocket server ──────────────────────────────────────────────────────────
+// Clients subscribe to a device via ?device=DEVICE_ID
+const wss = new WebSocketServer({ server, path: '/stream' });
+const subscribers = new Map();  // Map<deviceId, Set<ws>>
+const MAX_QUEUE   = 3;
+
+function subscribe(deviceId, ws) {
+  if (!subscribers.has(deviceId)) subscribers.set(deviceId, new Set());
+  subscribers.get(deviceId).add(ws);
 }
-
-function startGo2rtc(cameraIds) {
-  return new Promise(async (resolve, reject) => {
-    await killGo2rtc();
-    writeGo2rtcConfig(cameraIds);
-    console.log('[GO2RTC] Starting...');
-
-    g2rProc = spawn('go2rtc', ['-config', '/tmp/go2rtc.yaml'], {
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-    g2rProc.stdout.on('data', d => process.stdout.write('[GO2RTC] ' + d));
-    g2rProc.stderr.on('data', d => process.stderr.write('[GO2RTC] ' + d));
-    g2rProc.on('close', code => { console.log('[GO2RTC] Exited', code); g2rProc = null; });
-
-    let attempts = 0;
-    const check = setInterval(async () => {
-      try {
-        await axios.get(`${G2R}/api/streams`, { timeout: 500 });
-        clearInterval(check);
-        console.log('[GO2RTC] Ready');
-        resolve();
-      } catch (_) {
-        if (++attempts > 20) { clearInterval(check); reject(new Error('go2rtc failed to start')); }
-      }
-    }, 500);
-  });
+function unsubscribe(deviceId, ws) {
+  subscribers.get(deviceId)?.delete(ws);
 }
-
-// ── FFmpeg processes (one per camera) ─────────────────────────────────────────
-// Pipeline: IMOU HLS → FFmpeg (HEVC→H264 transcode) → RTSP → go2rtc → MSE
-const ffmpegProcs = {}; // { deviceId: ChildProcess }
-
-function startFFmpeg(deviceId, hlsUrl) {
-  stopFFmpeg(deviceId);
-
-  const rtspOut = `rtsp://127.0.0.1:8554/${deviceId}`;
-  console.log(`[FFMPEG:${deviceId}] Starting: ${hlsUrl.substring(0, 60)}...`);
-  console.log(`[FFMPEG:${deviceId}] Output:   ${rtspOut}`);
-
-  const args = [
-    '-hide_banner', '-v', 'warning',
-    // Input options — low latency HLS reading
-    '-allowed_extensions', 'ALL',
-    '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
-    '-fflags', 'nobuffer+discardcorrupt',
-    '-flags', 'low_delay',
-    '-probesize', '500000',
-    '-analyzeduration', '500000',
-    '-i', hlsUrl,
-    // Video: transcode HEVC→H264 (required for MSE browser compatibility)
-    '-c:v', 'libx264',
-    '-preset', 'ultrafast',
-    '-tune', 'zerolatency',
-    '-profile:v', 'baseline',
-    '-level', '4.2',
-    '-b:v', '1000k',
-    '-maxrate', '1200k',
-    '-bufsize', '500k',
-    '-g', '30',           // keyframe every 30 frames
-    '-sc_threshold', '0',
-    // Audio: AAC passthrough (MSE supports AAC natively)
-    '-c:a', 'aac',
-    '-b:a', '64k',
-    '-ar', '44100',
-    '-ac', '1',
-    // Output: RTSP to go2rtc
-    '-f', 'rtsp',
-    '-rtsp_transport', 'tcp',
-    rtspOut
-  ];
-
-  const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
-  ffmpegProcs[deviceId] = proc;
-
-  proc.stdout.on('data', d => process.stdout.write(`[FFMPEG:${deviceId}] ` + d));
-  proc.stderr.on('data', d => process.stderr.write(`[FFMPEG:${deviceId}] ` + d));
-  proc.on('close', (code, sig) => {
-    console.log(`[FFMPEG:${deviceId}] Exited code=${code} signal=${sig}`);
-    if (ffmpegProcs[deviceId] === proc) delete ffmpegProcs[deviceId];
-  });
-
-  return proc;
-}
-
-function stopFFmpeg(deviceId) {
-  const proc = ffmpegProcs[deviceId];
-  if (!proc) return;
-  delete ffmpegProcs[deviceId];
-  proc.kill('SIGTERM');
-  setTimeout(() => { try { proc.kill('SIGKILL'); } catch(_){} }, 3000);
-  console.log(`[FFMPEG:${deviceId}] Stopped`);
-}
-
-function stopAllFFmpeg() {
-  Object.keys(ffmpegProcs).forEach(stopFFmpeg);
-}
-
-// ── Wait for FFmpeg RTSP to be accepted by go2rtc ─────────────────────────────
-async function waitForStream(deviceId, timeoutMs = 15000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const r = await axios.get(`${G2R}/api/streams`, { timeout: 2000 });
-      const s = r.data?.[deviceId];
-      // go2rtc shows tracks once it has received data from FFmpeg via RTSP
-      if (s?.tracks?.length > 0) {
-        console.log(`[GO2RTC] Stream ${deviceId} tracks ready:`, s.tracks.map(t => t.codec).join(', '));
-        return true;
-      }
-    } catch (_) {}
-    await sleep(500);
+function broadcast(deviceId, data, opts = { binary: true }) {
+  const subs = subscribers.get(deviceId);
+  if (!subs) return;
+  for (const ws of subs) {
+    if (ws.readyState !== ws.OPEN) continue;
+    ws._queue = ws._queue || [];
+    ws._queue.push({ data, opts });
+    while (ws._queue.length > MAX_QUEUE) ws._queue.shift();
+    if (!ws._draining) drain(ws);
   }
-  console.warn(`[GO2RTC] Stream ${deviceId} tracks not confirmed after ${timeoutMs}ms`);
-  return false;
+}
+function broadcastJson(deviceId, obj) {
+  broadcast(deviceId, JSON.stringify(obj), { binary: false });
+}
+function drain(ws) {
+  if (!ws._queue?.length) { ws._draining = false; return; }
+  ws._draining = true;
+  const { data, opts } = ws._queue.shift();
+  try { ws.send(data, opts, () => drain(ws)); }
+  catch (_) { ws._draining = false; }
 }
 
-// ── Proxy go2rtc HTTP + WebSocket ─────────────────────────────────────────────
-const g2rProxy = createProxyMiddleware({
-  target: G2R,
-  changeOrigin: true,
-  ws: true,
-  pathRewrite: { '^/go2rtc': '' },
-  on: {
-    error: (err, req, res) => {
-      console.error('[PROXY] go2rtc error:', err.message);
-      if (res?.writeHead) try { res.status(502).json({ error: 'go2rtc unavailable' }); } catch(_) {}
-    }
+wss.on('connection', (ws, req) => {
+  const params   = new URL(req.url, 'http://localhost').searchParams;
+  const deviceId = params.get('device');
+  if (!deviceId || !CAMERAS.find(c => c.id === deviceId)) {
+    ws.close(1008, 'Unknown device'); return;
+  }
+
+  ws._queue = []; ws._draining = false;
+  subscribe(deviceId, ws);
+  console.log(`[WS:${deviceId}] Client connected (${subscribers.get(deviceId).size} total)`);
+
+  // Send cached init segment immediately so MSE can set up codec
+  const init = mgr.getInit(deviceId);
+  if (init) ws.send(init, { binary: true });
+
+  ws.on('close', () => {
+    unsubscribe(deviceId, ws);
+    console.log(`[WS:${deviceId}] Client disconnected (${subscribers.get(deviceId)?.size || 0} total)`);
+  });
+  ws.on('error', err => console.error(`[WS:${deviceId}] Error:`, err.message));
+});
+
+mgr.on('init', (deviceId, chunk) => broadcast(deviceId, chunk));
+mgr.on('data', (deviceId, chunk) => broadcast(deviceId, chunk));
+
+// ── Auto-recover when FFmpeg dies ─────────────────────────────────────────────
+mgr.on('end', async deviceId => {
+  const state   = getState(deviceId);
+  const viewers = subscribers.get(deviceId)?.size || 0;
+
+  await unbindCurrent(deviceId).catch(() => {});
+
+  if (!viewers || state.reconnecting || state.lock) return;
+
+  state.reconnecting = true;
+  console.log(`[RECOVER:${deviceId}] FFmpeg ended — auto-restarting in 3s`);
+  broadcastJson(deviceId, { type: 'reconnecting' });
+
+  await sleep(3000);
+  try {
+    const chosen = await bindAndGetUrl(deviceId, state.quality);
+    const { ok }  = await fetchPlaylist(chosen.hls);
+    if (!ok) throw new Error('Playlist not ready');
+
+    await mgr.start(deviceId, chosen.hls);
+
+    await new Promise((resolve, reject) => {
+      if (mgr.getInit(deviceId)) return resolve();
+      const t     = setTimeout(() => reject(new Error('init timeout')), 20000);
+      const onEnd = (id) => { if (id === deviceId) { clearTimeout(t); reject(new Error('exited again')); } };
+      mgr.once('init', (id) => { if (id === deviceId) { clearTimeout(t); mgr.removeListener('end', onEnd); resolve(); } });
+      mgr.once('end', onEnd);
+    });
+
+    // Send fresh init to all subscribers so MSE resets
+    const init = mgr.getInit(deviceId);
+    if (init) broadcast(deviceId, init);
+    broadcastJson(deviceId, { type: 'reconnected' });
+    console.log(`[RECOVER:${deviceId}] Stream restored`);
+  } catch (err) {
+    console.error(`[RECOVER:${deviceId}] Failed:`, err.message);
+    broadcastJson(deviceId, { type: 'stream_ended' });
+    await unbindCurrent(deviceId).catch(() => {});
+  } finally {
+    state.reconnecting = false;
   }
 });
-app.use('/go2rtc', g2rProxy);
 
 // ── IMOU helpers ──────────────────────────────────────────────────────────────
 async function unbindCurrent(deviceId) {
@@ -204,6 +156,14 @@ async function unbindCurrent(deviceId) {
     if (tok) { await request('unbindLive', { liveToken: tok }); return true; }
   } catch (_) {}
   return false;
+}
+
+async function fetchPlaylist(url) {
+  try {
+    const r    = await axios.get(url, { timeout: 6000 });
+    const body = String(r.data || '');
+    return { ok: body.includes('.ts') && !body.includes('errorcode'), body };
+  } catch (e) { return { ok: false, body: e.message }; }
 }
 
 async function bindAndGetUrl(deviceId, streamId) {
@@ -217,20 +177,10 @@ async function bindAndGetUrl(deviceId, streamId) {
       || streams[0];
 }
 
-async function fetchPlaylist(url) {
-  try {
-    const r    = await axios.get(url, { timeout: 6000 });
-    const body = String(r.data || '');
-    return { ok: body.includes('.ts') && !body.includes('errorcode'), body };
-  } catch (e) { return { ok: false, body: e.message }; }
-}
-
-// ── Per-device lock ───────────────────────────────────────────────────────────
-const locks = {};
-function getLock(id) { return locks[id] || (locks[id] = { connecting: false }); }
-
-// ── API: cameras ──────────────────────────────────────────────────────────────
-app.get('/api/cameras', (req, res) => res.json({ cameras: CAMERAS }));
+// ── API: list cameras ─────────────────────────────────────────────────────────
+app.get('/api/cameras', (req, res) => {
+  res.json({ cameras: CAMERAS });
+});
 
 // ── API: start stream ─────────────────────────────────────────────────────────
 app.get('/api/stream/:deviceId', async (req, res) => {
@@ -240,19 +190,18 @@ app.get('/api/stream/:deviceId', async (req, res) => {
   if (!CAMERAS.find(c => c.id === deviceId))
     return res.status(403).json({ error: 'Unknown device' });
 
-  const lock = getLock(deviceId);
-  if (lock.connecting) return res.status(429).json({ error: 'Already connecting' });
-  lock.connecting = true;
+  const state = getState(deviceId);
+  if (state.lock) return res.status(429).json({ error: 'Already connecting — please wait' });
+  state.lock = true;
 
   try {
-    // Stop any existing FFmpeg for this device
-    stopFFmpeg(deviceId);
-
-    // Unbind stale IMOU session
+    mgr.stop(deviceId);
     const hadSession = await unbindCurrent(deviceId);
-    if (hadSession) { await sleep(3000); }
+    if (hadSession) {
+      console.log(`[STREAM:${deviceId}] Waiting 3s for session reset`);
+      await sleep(3000);
+    }
 
-    // Get fresh HLS URL
     const chosen = await bindAndGetUrl(deviceId, streamId);
     const { ok, body } = await fetchPlaylist(chosen.hls);
     console.log(`[STREAM:${deviceId}] Playlist:`, body.substring(0, 120).replace(/\n/g, ' | '));
@@ -262,49 +211,46 @@ app.get('/api/stream/:deviceId', async (req, res) => {
       return res.status(502).json({ error: 'Camera not ready — wait 15s and try again' });
     }
 
-    // Start our FFmpeg → RTSP → go2rtc pipeline
-    startFFmpeg(deviceId, chosen.hls);
+    state.quality = streamId;
+    await mgr.start(deviceId, chosen.hls);
 
-    // Give FFmpeg 3s to connect to go2rtc before waiting for tracks
-    await sleep(3000);
-
-    // Wait up to 12s for go2rtc to receive tracks from FFmpeg
-    const ready = await waitForStream(deviceId, 12000);
-    if (!ready) {
-      console.warn(`[STREAM:${deviceId}] Tracks not confirmed — browser will connect anyway`);
-    }
-
-    res.json({
-      success: true,
-      wsUrl:  `/go2rtc/api/ws?src=${deviceId}`,
-      mseUrl: `/go2rtc/api/stream.mp4?src=${deviceId}`,
+    await new Promise((resolve, reject) => {
+      if (mgr.getInit(deviceId)) return resolve();
+      const t     = setTimeout(() => reject(new Error('FFmpeg init timeout')), 20000);
+      const onEnd = (id) => { if (id === deviceId) { clearTimeout(t); reject(new Error('FFmpeg exited before init')); } };
+      mgr.once('init', (id) => { if (id === deviceId) { clearTimeout(t); mgr.removeListener('end', onEnd); resolve(); } });
+      mgr.once('end', onEnd);
     });
+
+    res.json({ success: true, wsUrl: `/stream?device=${deviceId}` });
   } catch (err) {
     console.error(`[STREAM ERROR:${deviceId}]:`, err.message);
     res.status(500).json({ error: err.message });
   } finally {
-    lock.connecting = false;
+    state.lock = false;
   }
 });
 
 // ── API: stop stream ──────────────────────────────────────────────────────────
 app.post('/api/stream/:deviceId/stop', async (req, res) => {
   const { deviceId } = req.params;
-  stopFFmpeg(deviceId);
+  mgr.stop(deviceId);
+  getState(deviceId).reconnecting = false;
   await unbindCurrent(deviceId);
   res.json({ success: true });
 });
 
-// ── API: flush sessions ───────────────────────────────────────────────────────
+// ── API: flush stuck sessions ─────────────────────────────────────────────────
 app.post('/api/stream/:deviceId/flush', async (req, res) => {
   const { deviceId } = req.params;
-  stopFFmpeg(deviceId);
+  mgr.stop(deviceId);
+  getState(deviceId).reconnecting = false;
   let unbound = 0;
   for (let i = 0; i < 5; i++) {
     if (!await unbindCurrent(deviceId)) break;
     unbound++; await sleep(500);
   }
-  res.json({ success: true, unbound, message: `Cleared ${unbound} session(s). Wait 15s.` });
+  res.json({ success: true, unbound, message: `Cleared ${unbound} session(s). Wait 15s before connecting.` });
 });
 
 // ── API: device online ────────────────────────────────────────────────────────
@@ -316,45 +262,16 @@ app.get('/api/device/:deviceId/online', async (req, res) => {
 });
 
 // ── API: health ───────────────────────────────────────────────────────────────
-app.get('/api/health', async (req, res) => {
-  let g2rStreams = {};
-  try { g2rStreams = (await axios.get(`${G2R}/api/streams`, { timeout: 1000 })).data; } catch (_) {}
-  res.json({
-    status: 'ok',
-    cameras: CAMERAS.length,
-    go2rtc: !!g2rProc,
-    ffmpeg: Object.keys(ffmpegProcs),
-    streams: Object.keys(g2rStreams),
-    time: new Date().toISOString()
-  });
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', cameras: CAMERAS.length, running: mgr.running(), time: new Date().toISOString() });
 });
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, '..', 'public', 'index.html')));
 
-process.on('SIGINT',  () => { stopAllFFmpeg(); if (g2rProc) g2rProc.kill(); process.exit(); });
-process.on('SIGTERM', () => { stopAllFFmpeg(); if (g2rProc) g2rProc.kill(); process.exit(); });
+process.on('SIGINT',  () => { mgr.stopAll(); process.exit(); });
+process.on('SIGTERM', () => { mgr.stopAll(); process.exit(); });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
-(async () => {
-  try {
-    // Start go2rtc with all cameras pre-configured (RTSP sources from our FFmpeg)
-    await startGo2rtc(CAMERAS.map(c => c.id));
-  } catch (e) {
-    console.error('[FATAL] go2rtc failed to start:', e.message);
-    process.exit(1);
-  }
-
-  server.listen(PORT, () => {
-    console.log(`\n🟢 SENTINEL running at http://localhost:${PORT}`);
-    console.log(`   Cameras : ${CAMERAS.length}`);
-    console.log(`   go2rtc  : ${G2R} (MSE via RTSP from our FFmpeg)\n`);
-  });
-
-  // Forward WebSocket upgrades to go2rtc
-  server.on('upgrade', (req, socket, head) => {
-    if (req.url?.startsWith('/go2rtc')) {
-      req.url = req.url.replace(/^\/go2rtc/, '');
-      g2rProxy.upgrade(req, socket, head);
-    }
-  });
-})();
+server.listen(PORT, () => {
+  console.log(`\n🟢 SENTINEL running at http://localhost:${PORT}`);
+  console.log(`   Cameras: ${CAMERAS.length}\n`);
+});

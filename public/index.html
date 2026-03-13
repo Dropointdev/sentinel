@@ -39,7 +39,7 @@
     .grid.l3 .cam-card:first-child{grid-column:1/-1}
     .grid.l4,.grid.l5{grid-template-columns:repeat(2,1fr)}
     @media(max-width:700px){.grid{grid-template-columns:1fr!important}}
-    .cam-card{background:var(--surface);border:1px solid var(--border);overflow:hidden;position:relative;transition:border-color .2s}
+    .cam-card{background:var(--surface);border:1px solid var(--border);overflow:hidden;position:relative;transition:border-color .2s,box-shadow .2s}
     .cam-card:hover{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent),0 0 30px rgba(0,229,255,.05)}
     .cam-card::before,.cam-card::after{content:'';position:absolute;width:16px;height:16px;z-index:10;pointer-events:none}
     .cam-card::before{top:9px;left:9px;border-top:2px solid var(--accent);border-left:2px solid var(--accent)}
@@ -103,16 +103,18 @@
 <main><div class="grid l2" id="grid"></div></main>
 <footer>
   <span id="fmsg">INITIALISING...</span>
-  <span>SENTINEL v5.1 // go2rtc+MSE // IMOU</span>
+  <span>SENTINEL v5.0 // WS+MSE // IMOU</span>
 </footer>
 <div id="toast"></div>
 
 <script>
 let cameras = [], currentQuality = 'HD', currentLayout = 'grid';
-const S = {}; // per-cam state
+
+// Per-camera MSE state
+const S = {}; // { [id]: { ws, ms, sb, queue, flushing, frameCount, latTimer } }
 
 setInterval(() => {
-  const t = new Date().toLocaleTimeString('en-GB', { hour12: false });
+  const t = new Date().toLocaleTimeString('en-GB',{hour12:false});
   document.getElementById('clock').textContent = t;
   document.querySelectorAll('.cam-ts').forEach(e => e.textContent = t);
 }, 1000);
@@ -123,53 +125,44 @@ async function init() {
     const r = await fetch('/api/cameras');
     cameras = (await r.json()).cameras;
     buildGrid();
-    setFooter(`${cameras.length} CAMERA(S) CONFIGURED`);
+    setFooter(`${cameras.length} CAMERA(S) — CLICK CONNECT ALL`);
     cameras.forEach(async cam => {
       try {
         const r = await fetch(`/api/device/${cam.id}/online`);
         const d = await r.json();
         setStatus(cam.id, d.online ? 'idle' : 'error', d.online ? 'READY' : 'OFFLINE');
-      } catch (_) {}
+      } catch(_){}
     });
-  } catch (e) { setFooter('INIT FAILED — ' + e.message); }
+  } catch(e){ setFooter('INIT FAILED — ' + e.message); }
 }
 
 // ── Grid ──────────────────────────────────────────────────────────────────────
 function buildGrid() {
   const n    = cameras.length;
   const grid = document.getElementById('grid');
-  grid.className = `grid l${Math.min(n, 5)}`;
-  grid.innerHTML = cameras.map(cardHTML).join('');
+  grid.className = `grid l${Math.min(n,5)}`;
+  grid.innerHTML = cameras.map(c => cardHTML(c)).join('');
 }
 
-function cardHTML({ id, label }) {
+function cardHTML({id, label}) {
   return `<div class="cam-card" id="card-${id}">
     <div class="vwrap">
       <video id="vid-${id}" muted playsinline></video>
       <div class="ph" id="ph-${id}">
-        <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#00e5ff" stroke-width="1">
-          <path d="M15 10l4.553-2.277A1 1 0 0121 8.723v6.554a1 1 0 01-1.447.894L15 14M3 8a2 2 0 012-2h10a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"/>
-        </svg>
+        <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#00e5ff" stroke-width="1"><path d="M15 10l4.553-2.277A1 1 0 0121 8.723v6.554a1 1 0 01-1.447.894L15 14M3 8a2 2 0 012-2h10a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"/></svg>
         <p>${label}<br><span style="font-size:8px;opacity:.5">${id}</span></p>
         <button class="ph-btn" onclick="connectCam('${id}')">▶ CONNECT</button>
       </div>
       <div class="spin" id="spin-${id}"><div class="ring"></div></div>
       <div class="hud">
-        <div class="hud-top">
-          <div class="tag id">${label}</div>
-          <div class="tag idle" id="st-${id}">NO SIGNAL</div>
-        </div>
-        <div class="hud-bot">
-          <div class="cam-name">${label}</div>
-          <div class="cam-ts">--:--:--</div>
-        </div>
+        <div class="hud-top"><div class="tag id">${label}</div><div class="tag idle" id="st-${id}">NO SIGNAL</div></div>
+        <div class="hud-bot"><div class="cam-name">${label}</div><div class="cam-ts">--:--:--</div></div>
       </div>
     </div>
     <div class="card-foot">
       <div class="devid">${id}</div>
       <div class="card-acts">
         <span class="latency good" id="lat-${id}">--ms</span>
-        <button class="ibtn" id="mute-${id}" onclick="toggleMute('${id}')">UNMUTE</button>
         <button class="ibtn" onclick="fullscreen('${id}')">FULL</button>
         <button class="ibtn red" onclick="stopCam('${id}')">STOP</button>
       </div>
@@ -177,260 +170,217 @@ function cardHTML({ id, label }) {
   </div>`;
 }
 
-// ── Connect ───────────────────────────────────────────────────────────────────
+// ── Connect all / stop all ────────────────────────────────────────────────────
 function connectAll() { cameras.forEach(c => connectCam(c.id)); }
 function stopAll()    { cameras.forEach(c => stopCam(c.id)); }
 
+// ── Connect one camera ────────────────────────────────────────────────────────
 async function connectCam(id) {
-  setStatus(id, 'loading', 'CONNECTING...'); spinner(id, true); hidePH(id);
+  setStatus(id, 'loading', 'CONNECTING...');
+  spinner(id, true); hidePH(id);
   try {
     const r = await fetch(`/api/stream/${id}?quality=${currentQuality}`);
     const j = await r.json();
     if (!j.success) throw new Error(j.error || 'Failed');
-    console.log(`[${id}] Got wsUrl:`, j.wsUrl);
-    openMSE(id, j.wsUrl);
-  } catch (e) {
+    openWS(id, j.wsUrl);
+  } catch(e) {
     spinner(id, false); showPH(id);
     setStatus(id, 'error', '✕ ERROR');
     toast(`${id}: ${e.message}`, true);
   }
 }
 
-// ── go2rtc MSE via WebSocket ──────────────────────────────────────────────────
-function openMSE(id, wsPath) {
-  closeMSE(id);
-
-  const state = {
-    ms: null, sb: null, ws: null,
-    queue: [], flushing: false,
-    frameCount: 0, latTimer: null,
-    codec: null
-  };
-  S[id] = state;
+// ── WebSocket + MSE ───────────────────────────────────────────────────────────
+function openWS(id, wsPath) {
+  closeWS(id);
+  S[id] = { ws:null, ms:null, sb:null, queue:[], appending:false, trimming:false, frameCount:0, latTimer:null };
+  const s = S[id];
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws    = new WebSocket(`${proto}//${location.host}${wsPath}`);
-  ws.binaryType = 'arraybuffer';
-  state.ws = ws;
+  s.ws = new WebSocket(`${proto}//${location.host}${wsPath}`);
+  s.ws.binaryType = 'arraybuffer';
 
-  const vid = document.getElementById(`vid-${id}`);
+  const mime = ['video/mp4; codecs="avc1.640028"','video/mp4; codecs="avc1.42E028"','video/mp4; codecs="avc1.42001E"']
+    .find(m => MediaSource.isTypeSupported(m)) || 'video/mp4; codecs="avc1.42E028"';
 
-  function initMSE(codec) {
-    state.codec = codec;
-    console.log(`[${id}] Initialising MSE with codec: ${codec}`);
+  s.ms = new MediaSource();
+  const video = document.getElementById(`vid-${id}`);
+  video.src = URL.createObjectURL(s.ms);
 
-    const ms = new MediaSource();
-    state.ms = ms;
-    vid.src  = URL.createObjectURL(ms);
+  s.ms.addEventListener('sourceopen', () => {
+    try {
+      s.sb = s.ms.addSourceBuffer(mime);
+      s.sb.mode = 'segments';
+      s.sb.addEventListener('updateend', () => onUpdateEnd(id));
+    } catch(e){ toast('MSE error: '+e.message, true); }
+  });
 
-    ms.addEventListener('sourceopen', () => {
-      try {
-        const sb = ms.addSourceBuffer(codec);
-        state.sb = sb;
-        sb.mode  = 'segments';
-        sb.addEventListener('updateend', () => {
-          state.flushing = false;
-          trimBuffer(id);
-          flushQueue(id);
-        });
-        sb.addEventListener('error', e => {
-          console.error(`[${id}] SourceBuffer error:`, e);
-          toast(`${id}: buffer error — reconnecting`, true);
-          setTimeout(() => { if (S[id]) openMSE(id, wsPath); }, 2000);
-        });
-        console.log(`[${id}] SourceBuffer ready`);
-        // Flush anything queued before sourceopen fired
-        flushQueue(id);
-      } catch (e) {
-        console.error(`[${id}] MSE addSourceBuffer error:`, e.message);
-        toast(`${id}: codec error — ${e.message}`, true);
-      }
-    });
-  }
-
-  ws.onopen = () => {
-    console.log(`[${id}] WebSocket connected — sending MSE handshake`);
-    // Try video+audio codec first, fallback to video only
-    // go2rtc will confirm what it can provide
-    const preferred = [
-      'video/mp4; codecs="avc1.640029,mp4a.40.2"',
-      'video/mp4; codecs="avc1.42E028,mp4a.40.2"',
-      'video/mp4; codecs="avc1.640029"',
-      'video/mp4'
-    ].find(m => {
-      try { return MediaSource.isTypeSupported(m); } catch(_) { return false; }
-    }) || 'video/mp4';
-
-    console.log(`[${id}] Preferred codec:`, preferred);
-    ws.send(JSON.stringify({ type: 'mse', value: preferred }));
-  };
-
-  ws.onmessage = e => {
+  s.ws.onmessage = e => {
+    // JSON control messages
     if (typeof e.data === 'string') {
       try {
         const msg = JSON.parse(e.data);
-        console.log(`[${id}] go2rtc msg:`, msg);
-        if (msg.type === 'mse' && msg.value) {
-          // go2rtc confirmed the codec — initialise MSE now
-          initMSE(msg.value);
-        } else if (msg.type === 'error') {
-          console.error(`[${id}] go2rtc error:`, msg.value);
-          toast(`${id}: ${msg.value}`, true);
+        if (msg.type === 'reconnecting') {
+          setStatus(id, 'loading', 'RECONNECTING...'); spinner(id, true);
+        } else if (msg.type === 'reconnected') {
+          spinner(id, false); setStatus(id, 'live', '● LIVE');
+          s.queue = []; s.appending = false; s.trimming = false; s.frameCount = 0;
+        } else if (msg.type === 'stream_ended') {
+          spinner(id, false); showPH(id);
+          setStatus(id, 'idle', 'STREAM ENDED');
+          toast(`${id} stream ended — click Connect`);
         }
-      } catch (_) {}
+      } catch(_){}
       return;
     }
 
-    // Binary fMP4 data — queue it
-    state.queue.push(e.data);
-    // Keep buffer small — drop old frames if backing up
-    while (state.queue.length > 3) state.queue.shift();
-    flushQueue(id);
+    s.queue.push(e.data);
+    while (s.queue.length > 2) s.queue.shift();
+    flush(id);
 
-    state.frameCount++;
-    if (state.frameCount === 1) {
-      vid.play().catch(err => console.warn(`[${id}] Autoplay blocked:`, err.message));
-    }
-    if (state.frameCount === 5) {
-      spinner(id, false);
-      setStatus(id, 'live', '● LIVE');
-      toast(`${id} connected`);
-    }
+    s.frameCount++;
+    if (s.frameCount === 1) video.play().catch(()=>{});
+    if (s.frameCount === 3) { spinner(id, false); setStatus(id,'live','● LIVE'); toast(`${id} connected`); }
   };
 
-  ws.onclose = e => {
-    if (!S[id]) return; // intentionally closed
-    console.log(`[${id}] WS closed (${e.code}) — reconnecting in 2s`);
-    setStatus(id, 'loading', 'RECONNECTING...');
-    setTimeout(() => { if (S[id]) openMSE(id, wsPath); }, 2000);
-  };
+  s.ws.onclose = () => setStatus(id, 'idle', 'DISCONNECTED');
+  s.ws.onerror = () => { setStatus(id, 'error', '✕ WS ERR'); toast(`WS error on ${id}`, true); };
 
-  ws.onerror = err => {
-    console.error(`[${id}] WS error:`, err);
-    setStatus(id, 'error', '✕ WS ERR');
-    toast(`${id}: WebSocket error`, true);
-  };
-
-  startLatTimer(id, vid);
+  startLatTimer(id);
 }
 
-// ── Buffer management ─────────────────────────────────────────────────────────
-function flushQueue(id) {
+// ── MSE pipeline ─────────────────────────────────────────────────────────────
+// Two separate locks: appending vs trimming — they must never share one flag.
+// onUpdateEnd routes by which op was last started.
+
+function flush(id) {
   const s = S[id];
-  if (!s || s.flushing || !s.sb || s.sb.updating || !s.queue.length) return;
-  s.flushing = true;
-  try {
-    s.sb.appendBuffer(s.queue.shift());
-  } catch (e) {
-    s.flushing = false;
-    if (e.name === 'QuotaExceededError') trimBuffer(id);
-    else console.warn(`[${id}] appendBuffer error:`, e.message);
+  if (!s || s.appending || s.trimming || !s.sb || s.sb.updating || s.queue.length === 0) return;
+  s.appending = true;
+  try { s.sb.appendBuffer(s.queue.shift()); }
+  catch(e) {
+    s.appending = false;
+    if (e.name === 'QuotaExceededError') trim(id);
   }
 }
 
-function trimBuffer(id) {
-  const s   = S[id]; if (!s || !s.sb || s.sb.updating) return;
-  const vid = document.getElementById(`vid-${id}`);
-  if (!vid || !s.sb.buffered.length) return;
+function onUpdateEnd(id) {
+  const s = S[id]; if (!s) return;
+  if (s.trimming) {
+    // trim just finished — safe to append now
+    s.trimming = false;
+    flush(id);
+  } else {
+    // append just finished — trim old data then queue next append
+    s.appending = false;
+    trim(id);
+    // if trim didn't start (nothing to remove), continue appending
+    if (!s.trimming) flush(id);
+  }
+}
+
+function trim(id) {
+  const s = S[id];
+  if (!s || s.trimming || s.appending || !s.sb || s.sb.updating) return;
+  const video = document.getElementById(`vid-${id}`);
+  if (!video || !s.sb.buffered.length) return;
   const start  = s.sb.buffered.start(0);
-  const trimTo = vid.currentTime - 1.5;
+  const trimTo = video.currentTime - 1.0;
   if (trimTo > start + 0.5) {
-    try { s.flushing = true; s.sb.remove(start, trimTo); }
-    catch (_) { s.flushing = false; }
+    try { s.trimming = true; s.sb.remove(start, trimTo); }
+    catch(_) { s.trimming = false; }
   }
 }
 
 // ── Latency monitor ───────────────────────────────────────────────────────────
-function startLatTimer(id, vid) {
+function startLatTimer(id) {
   stopLatTimer(id);
+  const video = document.getElementById(`vid-${id}`);
   const latEl = document.getElementById(`lat-${id}`);
+
   S[id].latTimer = setInterval(() => {
-    if (!vid?.buffered.length) return;
-    const end = vid.buffered.end(vid.buffered.length - 1);
-    const ms  = Math.round((end - vid.currentTime) * 1000);
+    if (!video || !video.buffered.length) return;
+    const s   = S[id]; if (!s) return;
+    const end = video.buffered.end(video.buffered.length - 1);
+    const ms  = Math.round((end - video.currentTime) * 1000);
+
     if (latEl) {
       latEl.textContent = ms + 'ms';
       latEl.className   = 'latency ' + (ms < 1000 ? 'good' : ms < 2500 ? 'warn' : 'bad');
     }
-    // Catchup if buffer drifts beyond 1.5s
-    if (ms > 1500 && !vid.paused) {
-      console.log(`[${id}] Buffer drift ${ms}ms — skipping to live`);
-      vid.currentTime = end - 0.1;
+
+    // Smooth catchup: speed up 10% when 1-2.5s behind
+    if (ms > 2500) {
+      // Too far behind — hard jump to live edge
+      console.log(`[LAT:${id}] ${ms}ms — hard jump`);
+      video.currentTime = end - 0.3;
+      video.playbackRate = 1.0;
+    } else if (ms > 1000) {
+      // Gently speed up to catch live edge without a visual jump
+      video.playbackRate = 1.1;
+    } else {
+      video.playbackRate = 1.0;
     }
-    // Resume if stalled
-    if (vid.paused && S[id]?.frameCount > 5) vid.play().catch(() => {});
-  }, 500);
+
+    if (video.paused && s.frameCount > 5) video.play().catch(() => {});
+  }, 200);
 }
 
 function stopLatTimer(id) {
   if (S[id]?.latTimer) { clearInterval(S[id].latTimer); S[id].latTimer = null; }
 }
 
-// ── Stop / Close ──────────────────────────────────────────────────────────────
-function closeMSE(id) {
-  stopLatTimer(id);
-  const s = S[id];
-  if (s?.ws) { s.ws.onclose = null; s.ws.close(); }
-  if (s?.ms && s.ms.readyState === 'open') {
-    try { s.ms.endOfStream(); } catch(_) {}
-  }
-  delete S[id];
-}
-
+// ── Stop one camera ───────────────────────────────────────────────────────────
 function stopCam(id) {
-  closeMSE(id);
-  const vid = document.getElementById(`vid-${id}`);
-  if (vid) { vid.pause(); vid.src = ''; }
-  showPH(id);
-  setStatus(id, 'idle', 'NO SIGNAL');
+  closeWS(id);
+  const video = document.getElementById(`vid-${id}`);
+  if (video) { video.pause(); video.src = ''; }
+  delete S[id];
+  showPH(id); setStatus(id,'idle','NO SIGNAL');
   const l = document.getElementById(`lat-${id}`);
   if (l) { l.textContent = '--ms'; l.className = 'latency good'; }
-  fetch(`/api/stream/${id}/stop`, { method: 'POST' }).catch(() => {});
+  fetch(`/api/stream/${id}/stop`, { method:'POST' }).catch(()=>{});
   toast(`${id} disconnected`);
 }
 
-// ── Controls ──────────────────────────────────────────────────────────────────
-function toggleMute(id) {
-  const vid = document.getElementById(`vid-${id}`);
-  const btn = document.getElementById(`mute-${id}`);
-  if (!vid || !btn) return;
-  vid.muted = !vid.muted;
-  btn.textContent = vid.muted ? 'UNMUTE' : 'MUTE';
+function closeWS(id) {
+  stopLatTimer(id);
+  if (S[id]?.ws) { S[id].ws.close(); S[id].ws = null; }
 }
 
+// ── Layout / quality ──────────────────────────────────────────────────────────
 function setLayout(l) {
   currentLayout = l;
-  document.getElementById('l-grid').classList.toggle('active', l === 'grid');
-  document.getElementById('l-solo').classList.toggle('active', l === 'solo');
-  document.getElementById('grid').className = l === 'solo' ? 'grid l1' : `grid l${Math.min(cameras.length, 5)}`;
+  document.getElementById('l-grid').classList.toggle('active', l==='grid');
+  document.getElementById('l-solo').classList.toggle('active', l==='solo');
+  document.getElementById('grid').className = l === 'solo' ? 'grid l1' : `grid l${Math.min(cameras.length,5)}`;
 }
-
 function setQuality(q) {
   currentQuality = q;
-  document.getElementById('q-hd').classList.toggle('active', q === 'HD');
-  document.getElementById('q-sd').classList.toggle('active', q === 'SD');
-  cameras.filter(c => S[c.id]?.ws).forEach(c => { stopCam(c.id); setTimeout(() => connectCam(c.id), 300); });
+  document.getElementById('q-hd').classList.toggle('active', q==='HD');
+  document.getElementById('q-sd').classList.toggle('active', q==='SD');
+  const active = cameras.filter(c => S[c.id]?.ws);
+  active.forEach(c => { stopCam(c.id); setTimeout(() => connectCam(c.id), 300); });
 }
-
 function fullscreen(id) {
   const el = document.getElementById(`card-${id}`);
   if (!document.fullscreenElement) el.requestFullscreen();
   else document.exitFullscreen();
 }
 
-// ── UI Helpers ────────────────────────────────────────────────────────────────
+// ── UI helpers ────────────────────────────────────────────────────────────────
 function setStatus(id, type, text) {
   const el = document.getElementById(`st-${id}`);
   if (el) { el.className = `tag ${type}`; el.textContent = text; }
 }
 function spinner(id, on) { document.getElementById(`spin-${id}`)?.classList.toggle('on', on); }
-function showPH(id)  { const e = document.getElementById(`ph-${id}`);  if (e) e.style.display = 'flex'; }
-function hidePH(id)  { const e = document.getElementById(`ph-${id}`);  if (e) e.style.display = 'none'; }
-function setFooter(m){ document.getElementById('fmsg').textContent = m; }
-function toast(msg, isErr = false) {
+function showPH(id) { const e = document.getElementById(`ph-${id}`); if(e) e.style.display='flex'; }
+function hidePH(id) { const e = document.getElementById(`ph-${id}`); if(e) e.style.display='none'; }
+function setFooter(m) { document.getElementById('fmsg').textContent = m; }
+function toast(msg, isErr=false) {
   const t = document.getElementById('toast');
-  t.textContent = msg; t.className = 'show' + (isErr ? ' err' : '');
-  clearTimeout(t._t); t._t = setTimeout(() => t.className = '', 3500);
+  t.textContent = msg; t.className = 'show'+(isErr?' err':'');
+  clearTimeout(t._t); t._t = setTimeout(() => t.className='', 3500);
 }
 
 init();
