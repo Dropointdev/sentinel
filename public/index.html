@@ -217,7 +217,13 @@ function openMSE(id, wsPath) {
     } catch (e) { toast('MSE init error: ' + e.message, true); }
   });
 
-  ws.onopen    = () => console.log(`[WS:${id}] go2rtc connected`);
+  ws.onopen = () => {
+    console.log(`[WS:${id}] go2rtc connected — sending MSE handshake`);
+    // go2rtc WS protocol: client must request stream format first
+    const codecs = ['video/mp4; codecs="avc1.640029"', 'video/mp4; codecs="avc1.42E028"', 'video/mp4']
+      .filter(m => MediaSource.isTypeSupported(m));
+    ws.send(JSON.stringify({ type: 'mse', value: codecs }));
+  };
   ws.onmessage = e => {
     if (typeof e.data === 'string') return; // go2rtc sends text pings — ignore
     state.queue.push(e.data);
