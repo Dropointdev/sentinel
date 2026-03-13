@@ -219,10 +219,11 @@ function openMSE(id, wsPath) {
 
   ws.onopen = () => {
     console.log(`[WS:${id}] go2rtc connected — sending MSE handshake`);
-    // go2rtc WS protocol: client must request stream format first
-    const codecs = ['video/mp4; codecs="avc1.640029"', 'video/mp4; codecs="avc1.42E028"', 'video/mp4']
-      .filter(m => MediaSource.isTypeSupported(m));
-    ws.send(JSON.stringify({ type: 'mse', value: codecs }));
+    // go2rtc MSE protocol: send codec as a single string, not array
+    const codec = ['video/mp4; codecs="avc1.640029"', 'video/mp4; codecs="avc1.42E028"', 'video/mp4']
+      .find(m => MediaSource.isTypeSupported(m)) || 'video/mp4';
+    console.log(`[WS:${id}] sending handshake codec:`, codec);
+    ws.send(JSON.stringify({ type: 'mse', value: codec }));
   };
   ws.onmessage = e => {
     if (typeof e.data === 'string') return; // go2rtc sends text pings — ignore
