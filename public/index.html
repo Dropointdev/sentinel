@@ -2,30 +2,25 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
   <title>SENTINEL — Live Monitor</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow+Condensed:wght@300;400;600;700&display=swap" rel="stylesheet">
   <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    :root {
-      --bg:#090b0f; --surface:#0e1117; --border:#1c2230; --accent:#00e5ff;
-      --red:#ff3b3b; --green:#00ff88; --text:#c8d6e5; --muted:#4a5568;
-      --mono:'Share Tech Mono',monospace; --sans:'Barlow Condensed',sans-serif;
-    }
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    :root{--bg:#090b0f;--surface:#0e1117;--border:#1c2230;--accent:#00e5ff;--red:#ff3b3b;--green:#00ff88;--text:#c8d6e5;--muted:#4a5568;--mono:'Share Tech Mono',monospace;--sans:'Barlow Condensed',sans-serif}
     html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--sans);overflow-x:hidden}
     body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,.04) 2px,rgba(0,0,0,.04) 4px);pointer-events:none;z-index:9999}
-    header{display:flex;align-items:center;justify-content:space-between;padding:14px 28px;border-bottom:1px solid var(--border);background:var(--surface);position:sticky;top:0;z-index:100}
-    .logo{font-weight:700;font-size:22px;letter-spacing:6px;color:var(--accent)}
+    header{display:flex;align-items:center;justify-content:space-between;padding:12px 24px;border-bottom:1px solid var(--border);background:var(--surface);position:sticky;top:0;z-index:100}
+    .logo{font-weight:700;font-size:20px;letter-spacing:6px;color:var(--accent)}
     .logo span{color:var(--text);font-weight:300}
-    .header-right{display:flex;align-items:center;gap:24px}
-    .live-badge{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;color:var(--green);letter-spacing:2px}
-    .live-badge .dot{width:8px;height:8px;border-radius:50%;background:var(--green);animation:blink 1.4s ease-in-out infinite}
-    @keyframes blink{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.7)}}
-    #clock{font-family:var(--mono);font-size:13px;color:var(--muted);letter-spacing:1px}
-    .toolbar{display:flex;align-items:center;gap:10px;padding:10px 28px;border-bottom:1px solid var(--border);background:rgba(14,17,23,.9);flex-wrap:wrap}
-    .tlabel{font-size:11px;letter-spacing:3px;color:var(--muted);text-transform:uppercase}
-    .btn{font-family:var(--sans);font-size:12px;font-weight:600;letter-spacing:2px;text-transform:uppercase;padding:7px 16px;border:1px solid var(--border);background:transparent;color:var(--text);cursor:pointer;transition:all .15s}
+    .hdr-right{display:flex;align-items:center;gap:20px}
+    .live-badge{display:flex;align-items:center;gap:7px;font-family:var(--mono);font-size:10px;color:var(--green);letter-spacing:2px}
+    .live-badge .dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:blink 1.4s ease-in-out infinite}
+    @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+    #clock{font-family:var(--mono);font-size:12px;color:var(--muted);letter-spacing:1px}
+    .toolbar{display:flex;align-items:center;gap:8px;padding:8px 24px;border-bottom:1px solid var(--border);background:rgba(14,17,23,.95);flex-wrap:wrap}
+    .tlabel{font-size:10px;letter-spacing:3px;color:var(--muted);text-transform:uppercase}
+    .btn{font-family:var(--sans);font-size:11px;font-weight:600;letter-spacing:2px;text-transform:uppercase;padding:6px 14px;border:1px solid var(--border);background:transparent;color:var(--text);cursor:pointer;transition:all .15s}
     .btn:hover{border-color:var(--accent);color:var(--accent)}
     .btn.primary{border-color:var(--accent);color:var(--accent)}
     .btn.primary:hover{background:var(--accent);color:var(--bg)}
@@ -33,43 +28,50 @@
     .btn.danger:hover{background:var(--red);color:#fff}
     .btn.active{background:var(--accent);color:var(--bg);border-color:var(--accent)}
     .spacer{margin-left:auto}
-    .quality-toggle{display:flex}
-    .quality-toggle .btn{padding:7px 12px}
-    .quality-toggle .btn:first-child{border-right:none}
-    main{padding:20px 28px}
-    .camera-card{background:var(--surface);border:1px solid var(--border);overflow:hidden;position:relative;transition:border-color .2s,box-shadow .2s}
-    .camera-card:hover{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent),0 0 40px rgba(0,229,255,.06)}
-    .camera-card::before,.camera-card::after{content:'';position:absolute;width:18px;height:18px;z-index:10;pointer-events:none}
-    .camera-card::before{top:10px;left:10px;border-top:2px solid var(--accent);border-left:2px solid var(--accent)}
-    .camera-card::after{bottom:44px;right:10px;border-bottom:2px solid var(--accent);border-right:2px solid var(--accent)}
-    .video-wrap{position:relative;aspect-ratio:16/9;background:#000}
+    .qtoggle,.ltoggle{display:flex}
+    .qtoggle .btn,.ltoggle .btn{padding:6px 11px}
+    .qtoggle .btn:first-child,.ltoggle .btn:first-child{border-right:none}
+    main{padding:16px 24px}
+    .grid{display:grid;gap:14px}
+    .grid.l1{grid-template-columns:1fr}
+    .grid.l2{grid-template-columns:repeat(2,1fr)}
+    .grid.l3{grid-template-columns:repeat(2,1fr)}
+    .grid.l3 .cam-card:first-child{grid-column:1/-1}
+    .grid.l4,.grid.l5{grid-template-columns:repeat(2,1fr)}
+    @media(max-width:700px){.grid{grid-template-columns:1fr!important}}
+    .cam-card{background:var(--surface);border:1px solid var(--border);overflow:hidden;position:relative;transition:border-color .2s,box-shadow .2s}
+    .cam-card:hover{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent),0 0 30px rgba(0,229,255,.05)}
+    .cam-card::before,.cam-card::after{content:'';position:absolute;width:16px;height:16px;z-index:10;pointer-events:none}
+    .cam-card::before{top:9px;left:9px;border-top:2px solid var(--accent);border-left:2px solid var(--accent)}
+    .cam-card::after{bottom:43px;right:9px;border-bottom:2px solid var(--accent);border-right:2px solid var(--accent)}
+    .vwrap{position:relative;aspect-ratio:16/9;background:#000}
     video{width:100%;height:100%;object-fit:cover;display:block}
-    .hud{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:space-between;padding:14px 16px;pointer-events:none;z-index:5}
+    .hud{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:space-between;padding:12px 14px;pointer-events:none;z-index:5}
     .hud-top{display:flex;justify-content:space-between;align-items:flex-start}
-    .hud-bottom{display:flex;justify-content:space-between;align-items:flex-end}
-    .tag{font-family:var(--mono);font-size:10px;letter-spacing:1px;background:rgba(0,0,0,.65);padding:3px 8px}
+    .hud-bot{display:flex;justify-content:space-between;align-items:flex-end}
+    .tag{font-family:var(--mono);font-size:9px;letter-spacing:1px;background:rgba(0,0,0,.65);padding:3px 7px}
     .tag.id{color:var(--accent)}.tag.live{color:var(--green)}.tag.loading{color:#fa0}.tag.error{color:var(--red)}.tag.idle{color:var(--muted)}
-    .cam-title{font-size:16px;font-weight:600;letter-spacing:3px;text-transform:uppercase;color:#fff;background:rgba(0,0,0,.55);padding:4px 10px}
-    .cam-ts{font-family:var(--mono);font-size:10px;color:var(--muted);background:rgba(0,0,0,.55);padding:3px 8px}
-    .placeholder{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;background:#07090d;z-index:4}
-    .placeholder svg{opacity:.2}
-    .placeholder p{font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:2px;text-align:center;line-height:2}
-    .ph-btn{pointer-events:all;font-family:var(--sans);font-size:12px;font-weight:600;letter-spacing:3px;text-transform:uppercase;padding:9px 24px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer;transition:all .15s}
+    .cam-name{font-size:14px;font-weight:600;letter-spacing:3px;text-transform:uppercase;color:#fff;background:rgba(0,0,0,.55);padding:3px 9px}
+    .cam-ts{font-family:var(--mono);font-size:9px;color:var(--muted);background:rgba(0,0,0,.55);padding:3px 7px}
+    .ph{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:#07090d;z-index:4}
+    .ph svg{opacity:.18}
+    .ph p{font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:2px;text-align:center;line-height:1.9}
+    .ph-btn{pointer-events:all;font-family:var(--sans);font-size:11px;font-weight:600;letter-spacing:3px;text-transform:uppercase;padding:7px 20px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer;transition:all .15s}
     .ph-btn:hover{background:var(--accent);color:var(--bg)}
-    .spinner{position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.75);z-index:6}
-    .spinner.on{display:flex}
-    .ring{width:40px;height:40px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+    .spin{position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.75);z-index:6}
+    .spin.on{display:flex}
+    .ring{width:36px;height:36px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
     @keyframes spin{to{transform:rotate(360deg)}}
-    .card-footer{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-top:1px solid var(--border);background:rgba(0,0,0,.3)}
-    .card-footer .devid{font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:1px}
-    .card-footer .actions{display:flex;align-items:center;gap:8px}
-    .icon-btn{font-family:var(--mono);font-size:10px;letter-spacing:2px;padding:5px 12px;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;transition:all .15s;text-transform:uppercase}
-    .icon-btn:hover{border-color:var(--accent);color:var(--accent)}
-    .icon-btn.red:hover{border-color:var(--red);color:var(--red)}
-    .latency{font-family:var(--mono);font-size:10px;min-width:55px;text-align:right}
+    .card-foot{display:flex;align-items:center;justify-content:space-between;padding:7px 14px;border-top:1px solid var(--border);background:rgba(0,0,0,.3)}
+    .devid{font-family:var(--mono);font-size:9px;color:var(--muted);letter-spacing:1px}
+    .card-acts{display:flex;align-items:center;gap:7px}
+    .ibtn{font-family:var(--mono);font-size:9px;letter-spacing:2px;padding:4px 10px;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;transition:all .15s;text-transform:uppercase}
+    .ibtn:hover{border-color:var(--accent);color:var(--accent)}
+    .ibtn.red:hover{border-color:var(--red);color:var(--red)}
+    .latency{font-family:var(--mono);font-size:9px;min-width:50px;text-align:right}
     .latency.good{color:var(--green)}.latency.warn{color:#fa0}.latency.bad{color:var(--red)}
-    footer{border-top:1px solid var(--border);padding:10px 28px;display:flex;align-items:center;justify-content:space-between;font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:1px}
-    #toast{position:fixed;bottom:24px;right:24px;background:var(--surface);border:1px solid var(--accent);color:var(--accent);font-family:var(--mono);font-size:11px;letter-spacing:1px;padding:10px 18px;transform:translateY(60px);opacity:0;transition:all .3s ease;z-index:99999}
+    footer{border-top:1px solid var(--border);padding:8px 24px;display:flex;align-items:center;justify-content:space-between;font-family:var(--mono);font-size:9px;color:var(--muted);letter-spacing:1px}
+    #toast{position:fixed;bottom:20px;right:20px;background:var(--surface);border:1px solid var(--accent);color:var(--accent);font-family:var(--mono);font-size:10px;letter-spacing:1px;padding:9px 16px;transform:translateY(60px);opacity:0;transition:all .3s;z-index:99999}
     #toast.show{transform:translateY(0);opacity:1}
     #toast.err{border-color:var(--red);color:var(--red)}
   </style>
@@ -77,320 +79,282 @@
 <body>
 <header>
   <div class="logo">SENTINEL <span>// LIVE MONITOR</span></div>
-  <div class="header-right">
+  <div class="hdr-right">
     <div class="live-badge"><div class="dot"></div>SYSTEM ONLINE</div>
     <div id="clock">--:--:--</div>
   </div>
 </header>
 <div class="toolbar">
-  <span class="tlabel">Stream</span>
-  <button class="btn primary" onclick="loadStream()">▶ CONNECT</button>
-  <button class="btn danger"  onclick="stopStream()">■ DISCONNECT</button>
+  <span class="tlabel">Cameras</span>
+  <button class="btn primary" onclick="connectAll()">▶ ALL</button>
+  <button class="btn danger"  onclick="stopAll()">■ STOP ALL</button>
   <div class="spacer"></div>
+  <span class="tlabel">Layout</span>
+  <div class="ltoggle">
+    <button class="btn active" id="l-grid" onclick="setLayout('grid')">⊞</button>
+    <button class="btn"        id="l-solo" onclick="setLayout('solo')">□</button>
+  </div>
   <span class="tlabel">Quality</span>
-  <div class="quality-toggle">
+  <div class="qtoggle">
     <button class="btn active" id="q-hd" onclick="setQuality('HD')">HD</button>
     <button class="btn"        id="q-sd" onclick="setQuality('SD')">SD</button>
   </div>
 </div>
-<main id="main"></main>
+<main><div class="grid l2" id="grid"></div></main>
 <footer>
-  <span id="footer-msg">AWAITING CONNECTION</span>
-  <span>SENTINEL v4.2 // WS+MSE // SUB-1S</span>
+  <span id="fmsg">INITIALISING...</span>
+  <span>SENTINEL v5.0 // WS+MSE // IMOU</span>
 </footer>
 <div id="toast"></div>
 
 <script>
-let DEVICE_ID      = null;
-let currentQuality = 'HD';
-let ws             = null;
-let mediaSource    = null;
-let sourceBuffer   = null;
-let appendQueue    = [];
-let isFlushing     = false;
-let frameCount     = 0;
-let latencyTimer   = null;
+let cameras = [], currentQuality = 'HD', currentLayout = 'grid';
 
-// ── Clock ─────────────────────────────────────────────────────────────────────
+// Per-camera MSE state
+const S = {}; // { [id]: { ws, ms, sb, queue, flushing, frameCount, latTimer } }
+
 setInterval(() => {
-  const t = new Date().toLocaleTimeString('en-GB', { hour12: false });
+  const t = new Date().toLocaleTimeString('en-GB',{hour12:false});
   document.getElementById('clock').textContent = t;
-  const el = document.querySelector('.cam-ts');
-  if (el) el.textContent = t;
+  document.querySelectorAll('.cam-ts').forEach(e => e.textContent = t);
 }, 1000);
 
-// ── Build card ────────────────────────────────────────────────────────────────
-function buildCard() {
-  document.getElementById('main').innerHTML = `
-    <div class="camera-card">
-      <div class="video-wrap">
-        <video id="cam-video" muted playsinline></video>
-        <div class="placeholder" id="placeholder">
-          <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#00e5ff" stroke-width="1">
-            <path d="M15 10l4.553-2.277A1 1 0 0121 8.723v6.554a1 1 0 01-1.447.894L15 14M3 8a2 2 0 012-2h10a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"/>
-          </svg>
-          <p>${DEVICE_ID}<br>NO SIGNAL — CLICK CONNECT</p>
-          <button class="ph-btn" onclick="loadStream()">▶ CONNECT STREAM</button>
-        </div>
-        <div class="spinner" id="spinner"><div class="ring"></div></div>
-        <div class="hud">
-          <div class="hud-top">
-            <div class="tag id">${DEVICE_ID.slice(-8)}</div>
-            <div class="tag idle" id="status-tag">NO SIGNAL</div>
-          </div>
-          <div class="hud-bottom">
-            <div class="cam-title">CAM-01</div>
-            <div class="cam-ts">--:--:--</div>
-          </div>
-        </div>
-      </div>
-      <div class="card-footer">
-        <div class="devid">DEVICE // ${DEVICE_ID}</div>
-        <div class="actions">
-          <span class="latency good" id="latency">--ms</span>
-          <button class="icon-btn" onclick="toggleFullscreen()">FULLSCREEN</button>
-          <button class="icon-btn red" onclick="stopStream()">STOP</button>
-        </div>
-      </div>
-    </div>`;
+// ── Init ──────────────────────────────────────────────────────────────────────
+async function init() {
+  try {
+    const r = await fetch('/api/cameras');
+    cameras = (await r.json()).cameras;
+    buildGrid();
+    setFooter(`${cameras.length} CAMERA(S) — CLICK CONNECT ALL`);
+    cameras.forEach(async cam => {
+      try {
+        const r = await fetch(`/api/device/${cam.id}/online`);
+        const d = await r.json();
+        setStatus(cam.id, d.online ? 'idle' : 'error', d.online ? 'READY' : 'OFFLINE');
+      } catch(_){}
+    });
+  } catch(e){ setFooter('INIT FAILED — ' + e.message); }
 }
 
-// ── Connect ───────────────────────────────────────────────────────────────────
-async function loadStream() {
-  setStatus('loading', 'CONNECTING...');
-  showSpinner(true);
-  hidePlaceholder();
-  setFooter('STARTING STREAM...');
+// ── Grid ──────────────────────────────────────────────────────────────────────
+function buildGrid() {
+  const n    = cameras.length;
+  const grid = document.getElementById('grid');
+  grid.className = `grid l${Math.min(n,5)}`;
+  grid.innerHTML = cameras.map(c => cardHTML(c)).join('');
+}
+
+function cardHTML({id, label}) {
+  return `<div class="cam-card" id="card-${id}">
+    <div class="vwrap">
+      <video id="vid-${id}" muted playsinline></video>
+      <div class="ph" id="ph-${id}">
+        <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#00e5ff" stroke-width="1"><path d="M15 10l4.553-2.277A1 1 0 0121 8.723v6.554a1 1 0 01-1.447.894L15 14M3 8a2 2 0 012-2h10a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"/></svg>
+        <p>${label}<br><span style="font-size:8px;opacity:.5">${id}</span></p>
+        <button class="ph-btn" onclick="connectCam('${id}')">▶ CONNECT</button>
+      </div>
+      <div class="spin" id="spin-${id}"><div class="ring"></div></div>
+      <div class="hud">
+        <div class="hud-top"><div class="tag id">${label}</div><div class="tag idle" id="st-${id}">NO SIGNAL</div></div>
+        <div class="hud-bot"><div class="cam-name">${label}</div><div class="cam-ts">--:--:--</div></div>
+      </div>
+    </div>
+    <div class="card-foot">
+      <div class="devid">${id}</div>
+      <div class="card-acts">
+        <span class="latency good" id="lat-${id}">--ms</span>
+        <button class="ibtn" onclick="fullscreen('${id}')">FULL</button>
+        <button class="ibtn red" onclick="stopCam('${id}')">STOP</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+// ── Connect all / stop all ────────────────────────────────────────────────────
+function connectAll() { cameras.forEach(c => connectCam(c.id)); }
+function stopAll()    { cameras.forEach(c => stopCam(c.id)); }
+
+// ── Connect one camera ────────────────────────────────────────────────────────
+async function connectCam(id) {
+  setStatus(id, 'loading', 'CONNECTING...');
+  spinner(id, true); hidePH(id);
   try {
-    const res  = await fetch(`/api/stream/${DEVICE_ID}?quality=${currentQuality}`);
-    const json = await res.json();
-    if (!json.success) throw new Error(json.error || 'Failed');
-    openWebSocket(json.wsUrl);
-  } catch (err) {
-    showSpinner(false); showPlaceholder();
-    setStatus('error', '✕ ERROR');
-    setFooter('CONNECTION FAILED');
-    toast('Error: ' + err.message, true);
+    const r = await fetch(`/api/stream/${id}?quality=${currentQuality}`);
+    const j = await r.json();
+    if (!j.success) throw new Error(j.error || 'Failed');
+    openWS(id, j.wsUrl);
+  } catch(e) {
+    spinner(id, false); showPH(id);
+    setStatus(id, 'error', '✕ ERROR');
+    toast(`${id}: ${e.message}`, true);
   }
 }
 
 // ── WebSocket + MSE ───────────────────────────────────────────────────────────
-function openWebSocket(wsPath) {
-  closeAll();
-  frameCount = 0;
+function openWS(id, wsPath) {
+  closeWS(id);
+  S[id] = { ws:null, ms:null, sb:null, queue:[], flushing:false, frameCount:0, latTimer:null };
+  const s = S[id];
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${proto}//${location.host}${wsPath}`);
-  ws.binaryType = 'arraybuffer';
+  s.ws = new WebSocket(`${proto}//${location.host}${wsPath}`);
+  s.ws.binaryType = 'arraybuffer';
 
-  const mimeType =
-    ['video/mp4; codecs="avc1.640028"',
-     'video/mp4; codecs="avc1.42E028"',
-     'video/mp4; codecs="avc1.42001E"']
-    .find(m => MediaSource.isTypeSupported(m))
-    || 'video/mp4; codecs="avc1.42E028"';
+  const mime = ['video/mp4; codecs="avc1.640028"','video/mp4; codecs="avc1.42E028"','video/mp4; codecs="avc1.42001E"']
+    .find(m => MediaSource.isTypeSupported(m)) || 'video/mp4; codecs="avc1.42E028"';
 
-  mediaSource = new MediaSource();
-  const video = document.getElementById('cam-video');
-  video.src   = URL.createObjectURL(mediaSource);
+  s.ms = new MediaSource();
+  const video = document.getElementById(`vid-${id}`);
+  video.src = URL.createObjectURL(s.ms);
 
-  mediaSource.addEventListener('sourceopen', () => {
+  s.ms.addEventListener('sourceopen', () => {
     try {
-      sourceBuffer      = mediaSource.addSourceBuffer(mimeType);
-      sourceBuffer.mode = 'segments';
-      sourceBuffer.addEventListener('updateend', onUpdateEnd);
-    } catch (e) { toast('MSE init failed: ' + e.message, true); }
+      s.sb = s.ms.addSourceBuffer(mime);
+      s.sb.mode = 'segments';
+      s.sb.addEventListener('updateend', () => onUpdateEnd(id));
+    } catch(e){ toast('MSE error: '+e.message, true); }
   });
 
-  ws.onmessage = e => {
-    // JSON control messages from server
+  s.ws.onmessage = e => {
+    // JSON control messages
     if (typeof e.data === 'string') {
       try {
         const msg = JSON.parse(e.data);
         if (msg.type === 'reconnecting') {
-          setStatus('loading', 'RECONNECTING...');
-          showSpinner(true);
-          // Keep video element alive — server will send new init segment
+          setStatus(id, 'loading', 'RECONNECTING...'); spinner(id, true);
         } else if (msg.type === 'reconnected') {
-          showSpinner(false);
-          setStatus('live', '● LIVE');
-          // Reset MSE to accept new init segment
-          appendQueue = [];
-          isFlushing  = false;
-          frameCount  = 0;
+          spinner(id, false); setStatus(id, 'live', '● LIVE');
+          s.queue = []; s.flushing = false; s.frameCount = 0;
         } else if (msg.type === 'stream_ended') {
-          showSpinner(false);
-          showPlaceholder();
-          setStatus('idle', 'STREAM ENDED');
-          toast('Stream ended — click Connect to restart');
+          spinner(id, false); showPH(id);
+          setStatus(id, 'idle', 'STREAM ENDED');
+          toast(`${id} stream ended — click Connect`);
         }
-      } catch (_) {}
+      } catch(_){}
       return;
     }
 
-    appendQueue.push(e.data);
-    while (appendQueue.length > 2) appendQueue.shift();
-    flushQueue();
+    s.queue.push(e.data);
+    while (s.queue.length > 2) s.queue.shift();
+    flush(id);
 
-    frameCount++;
-    if (frameCount === 1) video.play().catch(() => {});
-    if (frameCount === 3) {
-      showSpinner(false);
-      setStatus('live', '● LIVE');
-      toast('Stream connected');
-    }
+    s.frameCount++;
+    if (s.frameCount === 1) video.play().catch(()=>{});
+    if (s.frameCount === 3) { spinner(id, false); setStatus(id,'live','● LIVE'); toast(`${id} connected`); }
   };
 
-  ws.onclose = (e) => {
-    stopLatencyTimer();
-    // Code 1011 = server killed it (FFmpeg died) — auto reconnect
-    if (e.code === 1011) {
-      setStatus('loading', 'RECONNECTING...');
-      console.log('[WS] Stream died, reconnecting in 2s...');
-      setTimeout(() => loadStream(), 2000);
-    } else {
-      setStatus('idle', 'DISCONNECTED');
-    }
-  };
-  ws.onerror = () => { setStatus('error', '✕ WS ERR'); toast('WebSocket error', true); };
+  s.ws.onclose = () => setStatus(id, 'idle', 'DISCONNECTED');
+  s.ws.onerror = () => { setStatus(id, 'error', '✕ WS ERR'); toast(`WS error on ${id}`, true); };
 
-  startLatencyTimer();
+  startLatTimer(id);
 }
 
 // ── MSE pipeline ──────────────────────────────────────────────────────────────
-function flushQueue() {
-  if (isFlushing || !sourceBuffer || sourceBuffer.updating || appendQueue.length === 0) return;
-  isFlushing = true;
-  try {
-    sourceBuffer.appendBuffer(appendQueue.shift());
-  } catch (e) {
-    isFlushing = false;
-    if (e.name === 'QuotaExceededError') trimBuffer();
-  }
+function flush(id) {
+  const s = S[id];
+  if (!s || s.flushing || !s.sb || s.sb.updating || s.queue.length === 0) return;
+  s.flushing = true;
+  try { s.sb.appendBuffer(s.queue.shift()); }
+  catch(e) { s.flushing = false; if (e.name === 'QuotaExceededError') trim(id); }
 }
 
-function onUpdateEnd() {
-  isFlushing = false;
-  trimBuffer();   // trim BEFORE next append — runs every fragment
-  flushQueue();
+function onUpdateEnd(id) {
+  const s = S[id]; if (!s) return;
+  s.flushing = false;
+  trim(id);
+  flush(id);
 }
 
-// Trim everything older than 1s behind playhead — runs after every fragment
-// This is what keeps latency from growing — must not be blocked
-function trimBuffer() {
-  const video = document.getElementById('cam-video');
-  if (!video || !sourceBuffer || sourceBuffer.updating) return;
-  if (!sourceBuffer.buffered.length) return;
-  const start  = sourceBuffer.buffered.start(0);
+function trim(id) {
+  const s = S[id]; if (!s || !s.sb || s.sb.updating) return;
+  const video = document.getElementById(`vid-${id}`);
+  if (!video || !s.sb.buffered.length) return;
+  const start  = s.sb.buffered.start(0);
   const trimTo = video.currentTime - 1.0;
   if (trimTo > start + 0.5) {
-    try {
-      isFlushing = true;
-      sourceBuffer.remove(start, trimTo);
-    } catch (_) { isFlushing = false; }
+    try { s.flushing = true; s.sb.remove(start, trimTo); }
+    catch(_) { s.flushing = false; }
   }
 }
 
-// ── Latency monitor — runs every 200ms, forces jump to live edge ──────────────
-function startLatencyTimer() {
-  stopLatencyTimer();
-  const video = document.getElementById('cam-video');
-  const latEl = document.getElementById('latency');
+// ── Latency monitor ───────────────────────────────────────────────────────────
+function startLatTimer(id) {
+  stopLatTimer(id);
+  const video = document.getElementById(`vid-${id}`);
+  const latEl = document.getElementById(`lat-${id}`);
+  const s     = S[id];
 
-  latencyTimer = setInterval(() => {
+  S[id].latTimer = setInterval(() => {
     if (!video || !video.buffered.length) return;
-
-    const end       = video.buffered.end(video.buffered.length - 1);
-    const latencyMs = Math.round((end - video.currentTime) * 1000);
-
+    const end   = video.buffered.end(video.buffered.length - 1);
+    const ms    = Math.round((end - video.currentTime) * 1000);
     if (latEl) {
-      latEl.textContent = latencyMs + 'ms';
-      latEl.className   = 'latency ' + (latencyMs < 1000 ? 'good' : latencyMs < 2500 ? 'warn' : 'bad');
+      latEl.textContent = ms + 'ms';
+      latEl.className   = 'latency ' + (ms < 1000 ? 'good' : ms < 2500 ? 'warn' : 'bad');
     }
-
-    // Always jump to live edge if more than 1.5s behind — no conditions
-    if (latencyMs > 1500) {
-      console.log('[LATENCY] ' + latencyMs + 'ms — jumping to live edge');
-      video.currentTime = end - 0.2;
-    }
-
-    // Kick video if stalled
-    if (video.paused && frameCount > 5 && !video.seeking) {
-      video.play().catch(() => {});
-    }
+    if (ms > 1500) { video.currentTime = end - 0.2; }
+    if (video.paused && s?.frameCount > 5) video.play().catch(()=>{});
   }, 200);
 }
 
-function stopLatencyTimer() {
-  if (latencyTimer) { clearInterval(latencyTimer); latencyTimer = null; }
+function stopLatTimer(id) {
+  if (S[id]?.latTimer) { clearInterval(S[id].latTimer); S[id].latTimer = null; }
 }
 
-// ── Stop ──────────────────────────────────────────────────────────────────────
-function stopStream() {
-  closeAll();
-  const video = document.getElementById('cam-video');
+// ── Stop one camera ───────────────────────────────────────────────────────────
+function stopCam(id) {
+  closeWS(id);
+  const video = document.getElementById(`vid-${id}`);
   if (video) { video.pause(); video.src = ''; }
-  showPlaceholder();
-  setStatus('idle', 'NO SIGNAL');
-  setFooter('STREAM DISCONNECTED');
-  const latEl = document.getElementById('latency');
-  if (latEl) { latEl.textContent = '--ms'; latEl.className = 'latency good'; }
-  toast('Stream disconnected');
-  fetch('/api/stream/stop', { method: 'POST' }).catch(() => {});
+  delete S[id];
+  showPH(id); setStatus(id,'idle','NO SIGNAL');
+  const l = document.getElementById(`lat-${id}`);
+  if (l) { l.textContent = '--ms'; l.className = 'latency good'; }
+  fetch(`/api/stream/${id}/stop`, { method:'POST' }).catch(()=>{});
+  toast(`${id} disconnected`);
 }
 
-function closeAll() {
-  stopLatencyTimer();
-  if (ws) { ws.close(); ws = null; }
-  mediaSource = null; sourceBuffer = null;
-  appendQueue = []; isFlushing = false;
+function closeWS(id) {
+  stopLatTimer(id);
+  if (S[id]?.ws) { S[id].ws.close(); S[id].ws = null; }
 }
 
-// ── Controls ──────────────────────────────────────────────────────────────────
+// ── Layout / quality ──────────────────────────────────────────────────────────
+function setLayout(l) {
+  currentLayout = l;
+  document.getElementById('l-grid').classList.toggle('active', l==='grid');
+  document.getElementById('l-solo').classList.toggle('active', l==='solo');
+  document.getElementById('grid').className = l === 'solo' ? 'grid l1' : `grid l${Math.min(cameras.length,5)}`;
+}
 function setQuality(q) {
   currentQuality = q;
-  document.getElementById('q-hd').classList.toggle('active', q === 'HD');
-  document.getElementById('q-sd').classList.toggle('active', q === 'SD');
-  if (ws) { stopStream(); setTimeout(loadStream, 300); }
+  document.getElementById('q-hd').classList.toggle('active', q==='HD');
+  document.getElementById('q-sd').classList.toggle('active', q==='SD');
+  const active = cameras.filter(c => S[c.id]?.ws);
+  active.forEach(c => { stopCam(c.id); setTimeout(() => connectCam(c.id), 300); });
 }
-
-function toggleFullscreen() {
-  const wrap = document.querySelector('.video-wrap');
-  if (!document.fullscreenElement) wrap.requestFullscreen();
+function fullscreen(id) {
+  const el = document.getElementById(`card-${id}`);
+  if (!document.fullscreenElement) el.requestFullscreen();
   else document.exitFullscreen();
 }
 
 // ── UI helpers ────────────────────────────────────────────────────────────────
-function setStatus(type, text) {
-  const el = document.getElementById('status-tag');
+function setStatus(id, type, text) {
+  const el = document.getElementById(`st-${id}`);
   if (el) { el.className = `tag ${type}`; el.textContent = text; }
 }
-function showSpinner(on)  { const el = document.getElementById('spinner');     if (el) el.classList.toggle('on', on); }
-function showPlaceholder(){ const el = document.getElementById('placeholder'); if (el) el.style.display = 'flex'; }
-function hidePlaceholder(){ const el = document.getElementById('placeholder'); if (el) el.style.display = 'none'; }
-function setFooter(msg)   { document.getElementById('footer-msg').textContent = msg; }
-function toast(msg, isErr = false) {
+function spinner(id, on) { document.getElementById(`spin-${id}`)?.classList.toggle('on', on); }
+function showPH(id) { const e = document.getElementById(`ph-${id}`); if(e) e.style.display='flex'; }
+function hidePH(id) { const e = document.getElementById(`ph-${id}`); if(e) e.style.display='none'; }
+function setFooter(m) { document.getElementById('fmsg').textContent = m; }
+function toast(msg, isErr=false) {
   const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.className = 'show' + (isErr ? ' err' : '');
-  clearTimeout(t._t);
-  t._t = setTimeout(() => { t.className = ''; }, 3500);
+  t.textContent = msg; t.className = 'show'+(isErr?' err':'');
+  clearTimeout(t._t); t._t = setTimeout(() => t.className='', 3500);
 }
 
-// ── Init ──────────────────────────────────────────────────────────────────────
-fetch('/api/health')
-  .then(r => r.json())
-  .then(d => {
-    DEVICE_ID = d.deviceId;
-    buildCard();
-    return fetch(`/api/device/${DEVICE_ID}/online`);
-  })
-  .then(r => r.json())
-  .then(d => {
-    setFooter(d.online ? 'DEVICE ONLINE — READY TO STREAM' : 'DEVICE OFFLINE');
-    toast(d.online ? 'Device online' : 'Device appears offline', !d.online);
-  })
-  .catch(err => setFooter('INIT FAILED — ' + err.message));
+init();
 </script>
 </body>
 </html>

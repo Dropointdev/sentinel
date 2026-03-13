@@ -5,14 +5,10 @@ const path    = require('path');
 const http    = require('http');
 const axios   = require('axios');
 const { WebSocketServer } = require('ws');
-const { request } = require('./imouclient');
-const { startStream, stopStream, getInitSegment, isRunning, bus } = require('./ffmpegstreamer');
+const { request }   = require('./imouclient');
+const StreamManager = require('./streammanager');
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-let _streamLock    = false;
-let _activeDevice  = null;   // currently streaming device
-let _activeQuality = 0;      // 0=HD 1=SD
-let _reconnecting  = false;
 
 const app    = express();
 const server = http.createServer(app);
@@ -21,44 +17,143 @@ const PORT   = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
-// ── WebSocket ─────────────────────────────────────────────────────────────────
+// ── Camera config ─────────────────────────────────────────────────────────────
+// CAMERAS env var: "deviceId1:Label 1,deviceId2:Label 2"
+// Falls back to legacy IMOU_DEVICE_ID for single-camera setups
+function parseCameras() {
+  if (process.env.CAMERAS) {
+    return process.env.CAMERAS.split(',').map(entry => {
+      const [id, ...rest] = entry.trim().split(':');
+      return { id: id.trim(), label: rest.join(':').trim() || id.trim() };
+    });
+  }
+  if (process.env.IMOU_DEVICE_ID) {
+    return [{ id: process.env.IMOU_DEVICE_ID, label: 'CAM-01' }];
+  }
+  return [];
+}
+const CAMERAS = parseCameras();
+console.log('[CONFIG] Cameras:', CAMERAS.map(c => `${c.id}(${c.label})`).join(', '));
+
+// ── Stream manager ────────────────────────────────────────────────────────────
+const mgr = new StreamManager();
+
+// Per-device state: lock + active quality
+const deviceState = {};  // { [deviceId]: { lock, quality, reconnecting } }
+function getState(id) {
+  if (!deviceState[id]) deviceState[id] = { lock: false, quality: 0, reconnecting: false };
+  return deviceState[id];
+}
+
+// ── WebSocket server ──────────────────────────────────────────────────────────
+// Clients subscribe to a device via ?device=DEVICE_ID
 const wss = new WebSocketServer({ server, path: '/stream' });
-const MAX_QUEUE = 3;
+const subscribers = new Map();  // Map<deviceId, Set<ws>>
+const MAX_QUEUE   = 3;
 
-wss.on('connection', ws => {
-  console.log('[WS] Client connected, total:', wss.clients.size);
-  ws._queue = []; ws._draining = false;
-  const init = getInitSegment();
-  if (init) ws.send(init, { binary: true });
-  ws.on('close', () => console.log('[WS] Client disconnected, total:', wss.clients.size));
-  ws.on('error', err => console.error('[WS] Error:', err.message));
-});
-
-function sendToClient(ws, chunk) {
-  if (ws.readyState !== ws.OPEN) return;
-  ws._queue.push(chunk);
-  while (ws._queue.length > MAX_QUEUE) ws._queue.shift();
-  if (!ws._draining) drain(ws);
+function subscribe(deviceId, ws) {
+  if (!subscribers.has(deviceId)) subscribers.set(deviceId, new Set());
+  subscribers.get(deviceId).add(ws);
+}
+function unsubscribe(deviceId, ws) {
+  subscribers.get(deviceId)?.delete(ws);
+}
+function broadcast(deviceId, data, opts = { binary: true }) {
+  const subs = subscribers.get(deviceId);
+  if (!subs) return;
+  for (const ws of subs) {
+    if (ws.readyState !== ws.OPEN) continue;
+    ws._queue = ws._queue || [];
+    ws._queue.push({ data, opts });
+    while (ws._queue.length > MAX_QUEUE) ws._queue.shift();
+    if (!ws._draining) drain(ws);
+  }
+}
+function broadcastJson(deviceId, obj) {
+  broadcast(deviceId, JSON.stringify(obj), { binary: false });
 }
 function drain(ws) {
-  if (ws._queue.length === 0) { ws._draining = false; return; }
+  if (!ws._queue?.length) { ws._draining = false; return; }
   ws._draining = true;
-  try { ws.send(ws._queue.shift(), { binary: true }, () => drain(ws)); }
+  const { data, opts } = ws._queue.shift();
+  try { ws.send(data, opts, () => drain(ws)); }
   catch (_) { ws._draining = false; }
 }
-bus.on('init', chunk => { for (const ws of wss.clients) sendToClient(ws, chunk); });
-bus.on('data', chunk => { for (const ws of wss.clients) sendToClient(ws, chunk); });
+
+wss.on('connection', (ws, req) => {
+  const params   = new URL(req.url, 'http://localhost').searchParams;
+  const deviceId = params.get('device');
+  if (!deviceId || !CAMERAS.find(c => c.id === deviceId)) {
+    ws.close(1008, 'Unknown device'); return;
+  }
+
+  ws._queue = []; ws._draining = false;
+  subscribe(deviceId, ws);
+  console.log(`[WS:${deviceId}] Client connected (${subscribers.get(deviceId).size} total)`);
+
+  // Send cached init segment immediately so MSE can set up codec
+  const init = mgr.getInit(deviceId);
+  if (init) ws.send(init, { binary: true });
+
+  ws.on('close', () => {
+    unsubscribe(deviceId, ws);
+    console.log(`[WS:${deviceId}] Client disconnected (${subscribers.get(deviceId)?.size || 0} total)`);
+  });
+  ws.on('error', err => console.error(`[WS:${deviceId}] Error:`, err.message));
+});
+
+mgr.on('init', (deviceId, chunk) => broadcast(deviceId, chunk));
+mgr.on('data', (deviceId, chunk) => broadcast(deviceId, chunk));
+
+// ── Auto-recover when FFmpeg dies ─────────────────────────────────────────────
+mgr.on('end', async deviceId => {
+  const state   = getState(deviceId);
+  const viewers = subscribers.get(deviceId)?.size || 0;
+
+  await unbindCurrent(deviceId).catch(() => {});
+
+  if (!viewers || state.reconnecting || state.lock) return;
+
+  state.reconnecting = true;
+  console.log(`[RECOVER:${deviceId}] FFmpeg ended — auto-restarting in 3s`);
+  broadcastJson(deviceId, { type: 'reconnecting' });
+
+  await sleep(3000);
+  try {
+    const chosen = await bindAndGetUrl(deviceId, state.quality);
+    const { ok }  = await fetchPlaylist(chosen.hls);
+    if (!ok) throw new Error('Playlist not ready');
+
+    await mgr.start(deviceId, chosen.hls);
+
+    await new Promise((resolve, reject) => {
+      if (mgr.getInit(deviceId)) return resolve();
+      const t     = setTimeout(() => reject(new Error('init timeout')), 20000);
+      const onEnd = (id) => { if (id === deviceId) { clearTimeout(t); reject(new Error('exited again')); } };
+      mgr.once('init', (id) => { if (id === deviceId) { clearTimeout(t); mgr.removeListener('end', onEnd); resolve(); } });
+      mgr.once('end', onEnd);
+    });
+
+    // Send fresh init to all subscribers so MSE resets
+    const init = mgr.getInit(deviceId);
+    if (init) broadcast(deviceId, init);
+    broadcastJson(deviceId, { type: 'reconnected' });
+    console.log(`[RECOVER:${deviceId}] Stream restored`);
+  } catch (err) {
+    console.error(`[RECOVER:${deviceId}] Failed:`, err.message);
+    broadcastJson(deviceId, { type: 'stream_ended' });
+    await unbindCurrent(deviceId).catch(() => {});
+  } finally {
+    state.reconnecting = false;
+  }
+});
 
 // ── IMOU helpers ──────────────────────────────────────────────────────────────
 async function unbindCurrent(deviceId) {
   try {
     const info = await request('getLiveStreamInfo', { deviceId, channelId: '0' });
     const tok  = (info.streams || [])[0]?.liveToken;
-    if (tok) {
-      await request('unbindLive', { liveToken: tok });
-      console.log('[IMOU] Unbound session');
-      return true;
-    }
+    if (tok) { await request('unbindLive', { liveToken: tok }); return true; }
   } catch (_) {}
   return false;
 }
@@ -68,163 +163,97 @@ async function fetchPlaylist(url) {
     const r    = await axios.get(url, { timeout: 6000 });
     const body = String(r.data || '');
     return { ok: body.includes('.ts') && !body.includes('errorcode'), body };
-  } catch (e) {
-    return { ok: false, body: e.message };
-  }
+  } catch (e) { return { ok: false, body: e.message }; }
 }
 
-// Bind IMOU session and return the HLS URL
 async function bindAndGetUrl(deviceId, streamId) {
   await request('bindDeviceLive', { deviceId, channelId: '0', streamId });
   await sleep(1000);
   const info    = await request('getLiveStreamInfo', { deviceId, channelId: '0' });
   const streams = info.streams || [];
   if (!streams.length) throw new Error('No streams from IMOU');
-  const chosen =
-    streams.find(s => s.hls?.startsWith('http:') && s.streamId === streamId) ||
-    streams.find(s => s.streamId === streamId) || streams[0];
-  if (!chosen?.hls) throw new Error('No HLS URL');
-  return chosen;
+  return streams.find(s => s.hls?.startsWith('http:') && s.streamId === streamId)
+      || streams.find(s => s.streamId === streamId)
+      || streams[0];
 }
 
-// ── Auto-restart when FFmpeg dies ─────────────────────────────────────────────
-bus.on('end', async () => {
-  if (!_activeDevice || _reconnecting || wss.clients.size === 0) {
-    // No active device, already reconnecting, or no viewers — just clean up
-    if (_activeDevice) await unbindCurrent(_activeDevice).catch(() => {});
-    return;
-  }
-
-  _reconnecting = true;
-  console.log('[RECOVER] FFmpeg ended — auto-restarting in 2s');
-
-  // Notify clients stream is briefly interrupted (they keep WS open)
-  for (const ws of wss.clients) {
-    if (ws.readyState === ws.OPEN)
-      try { ws.send(JSON.stringify({ type: 'reconnecting' })); } catch (_) {}
-  }
-
-  await sleep(2000);
-
-  try {
-    await unbindCurrent(_activeDevice);
-    await sleep(2000);
-
-    const chosen = await bindAndGetUrl(_activeDevice, _activeQuality);
-    const { ok, body } = await fetchPlaylist(chosen.hls);
-    if (!ok) throw new Error('Playlist not ready: ' + body.substring(0, 100));
-
-    console.log('[RECOVER] Got fresh URL, restarting FFmpeg');
-    await startStream(chosen.hls);
-
-    // Wait for new init segment and send to all connected clients
-    await new Promise((resolve, reject) => {
-      if (getInitSegment()) return resolve();
-      const t     = setTimeout(() => reject(new Error('init timeout')), 20000);
-      const onEnd = () => { clearTimeout(t); reject(new Error('FFmpeg exited again')); };
-      bus.once('init', () => { clearTimeout(t); bus.removeListener('end', onEnd); resolve(); });
-      bus.once('end', onEnd);
-    });
-
-    // Send fresh init segment to all connected clients so MSE resets codec
-    const init = getInitSegment();
-    if (init) {
-      for (const ws of wss.clients) {
-        if (ws.readyState === ws.OPEN)
-          try { ws.send(init, { binary: true }); } catch (_) {}
-      }
-    }
-
-    // Notify clients stream is back
-    for (const ws of wss.clients) {
-      if (ws.readyState === ws.OPEN)
-        try { ws.send(JSON.stringify({ type: 'reconnected' })); } catch (_) {}
-    }
-
-    console.log('[RECOVER] Stream restored');
-  } catch (err) {
-    console.error('[RECOVER] Failed:', err.message);
-    await unbindCurrent(_activeDevice).catch(() => {});
-    // Tell clients to reload
-    for (const ws of wss.clients) {
-      if (ws.readyState === ws.OPEN)
-        try { ws.send(JSON.stringify({ type: 'stream_ended' })); } catch (_) {}
-    }
-  } finally {
-    _reconnecting = false;
-  }
+// ── API: list cameras ─────────────────────────────────────────────────────────
+app.get('/api/cameras', (req, res) => {
+  res.json({ cameras: CAMERAS });
 });
 
-// ── GET /api/stream/:deviceId ─────────────────────────────────────────────────
+// ── API: start stream ─────────────────────────────────────────────────────────
 app.get('/api/stream/:deviceId', async (req, res) => {
   const { deviceId } = req.params;
   const streamId     = req.query.quality === 'SD' ? 1 : 0;
 
-  if (_streamLock) return res.status(429).json({ error: 'Already connecting — please wait' });
-  _streamLock = true;
+  if (!CAMERAS.find(c => c.id === deviceId))
+    return res.status(403).json({ error: 'Unknown device' });
+
+  const state = getState(deviceId);
+  if (state.lock) return res.status(429).json({ error: 'Already connecting — please wait' });
+  state.lock = true;
 
   try {
-    stopStream();
+    mgr.stop(deviceId);
     const hadSession = await unbindCurrent(deviceId);
     if (hadSession) {
-      console.log('[STREAM] Waiting 3s for camera to release session...');
+      console.log(`[STREAM:${deviceId}] Waiting 3s for session reset`);
       await sleep(3000);
     }
 
     const chosen = await bindAndGetUrl(deviceId, streamId);
     const { ok, body } = await fetchPlaylist(chosen.hls);
-    console.log('[STREAM] Playlist:', body.substring(0, 150).replace(/\n/g, ' | '));
+    console.log(`[STREAM:${deviceId}] Playlist:`, body.substring(0, 120).replace(/\n/g, ' | '));
 
     if (!ok) {
       await unbindCurrent(deviceId);
       return res.status(502).json({ error: 'Camera not ready — wait 15s and try again' });
     }
 
-    console.log('[STREAM] Starting FFmpeg');
-    _activeDevice  = deviceId;
-    _activeQuality = streamId;
-    await startStream(chosen.hls);
+    state.quality = streamId;
+    await mgr.start(deviceId, chosen.hls);
 
     await new Promise((resolve, reject) => {
-      if (getInitSegment()) return resolve();
+      if (mgr.getInit(deviceId)) return resolve();
       const t     = setTimeout(() => reject(new Error('FFmpeg init timeout')), 20000);
-      const onEnd = () => { clearTimeout(t); reject(new Error('FFmpeg exited before init')); };
-      bus.once('init', () => { clearTimeout(t); bus.removeListener('end', onEnd); resolve(); });
-      bus.once('end', onEnd);
+      const onEnd = (id) => { if (id === deviceId) { clearTimeout(t); reject(new Error('FFmpeg exited before init')); } };
+      mgr.once('init', (id) => { if (id === deviceId) { clearTimeout(t); mgr.removeListener('end', onEnd); resolve(); } });
+      mgr.once('end', onEnd);
     });
 
-    res.json({ success: true, wsUrl: '/stream' });
+    res.json({ success: true, wsUrl: `/stream?device=${deviceId}` });
   } catch (err) {
-    console.error('[STREAM ERROR]:', err.message);
-    _activeDevice = null;
+    console.error(`[STREAM ERROR:${deviceId}]:`, err.message);
     res.status(500).json({ error: err.message });
   } finally {
-    _streamLock = false;
+    state.lock = false;
   }
 });
 
-// ── POST /api/stream/flush ────────────────────────────────────────────────────
-app.post('/api/stream/flush', async (req, res) => {
-  const deviceId = req.query.deviceId || process.env.IMOU_DEVICE_ID;
-  console.log('[FLUSH] Clearing sessions for', deviceId);
-  stopStream(); _activeDevice = null;
+// ── API: stop stream ──────────────────────────────────────────────────────────
+app.post('/api/stream/:deviceId/stop', async (req, res) => {
+  const { deviceId } = req.params;
+  mgr.stop(deviceId);
+  getState(deviceId).reconnecting = false;
+  await unbindCurrent(deviceId);
+  res.json({ success: true });
+});
+
+// ── API: flush stuck sessions ─────────────────────────────────────────────────
+app.post('/api/stream/:deviceId/flush', async (req, res) => {
+  const { deviceId } = req.params;
+  mgr.stop(deviceId);
+  getState(deviceId).reconnecting = false;
   let unbound = 0;
   for (let i = 0; i < 5; i++) {
-    const ok = await unbindCurrent(deviceId);
-    if (!ok) break;
+    if (!await unbindCurrent(deviceId)) break;
     unbound++; await sleep(500);
   }
   res.json({ success: true, unbound, message: `Cleared ${unbound} session(s). Wait 15s before connecting.` });
 });
 
-// ── POST /api/stream/stop ─────────────────────────────────────────────────────
-app.post('/api/stream/stop', async (req, res) => {
-  const deviceId = _activeDevice || req.query.deviceId || process.env.IMOU_DEVICE_ID;
-  stopStream(); _activeDevice = null; _reconnecting = false;
-  if (deviceId) await unbindCurrent(deviceId);
-  res.json({ success: true });
-});
-
+// ── API: device online ────────────────────────────────────────────────────────
 app.get('/api/device/:deviceId/online', async (req, res) => {
   try {
     const data = await request('deviceOnline', { deviceId: req.params.deviceId });
@@ -232,18 +261,17 @@ app.get('/api/device/:deviceId/online', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── API: health ───────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', deviceId: process.env.IMOU_DEVICE_ID, streaming: isRunning(), time: new Date().toISOString() });
+  res.json({ status: 'ok', cameras: CAMERAS.length, running: mgr.running(), time: new Date().toISOString() });
 });
 
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
-});
+app.get('*', (req, res) => res.sendFile(path.join(__dirname, '..', 'public', 'index.html')));
 
-process.on('SIGINT',  () => { stopStream(); process.exit(); });
-process.on('SIGTERM', () => { stopStream(); process.exit(); });
+process.on('SIGINT',  () => { mgr.stopAll(); process.exit(); });
+process.on('SIGTERM', () => { mgr.stopAll(); process.exit(); });
 
 server.listen(PORT, () => {
   console.log(`\n🟢 SENTINEL running at http://localhost:${PORT}`);
-  console.log(`   Device : ${process.env.IMOU_DEVICE_ID}\n`);
+  console.log(`   Cameras: ${CAMERAS.length}\n`);
 });
