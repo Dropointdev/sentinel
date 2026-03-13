@@ -43,7 +43,8 @@ function writeConfig() {
   const fs = require('fs');
   let streamLines = '';
   for (const [name, hlsUrl] of Object.entries(activeStreams)) {
-    streamLines += `  ${name}:\n    - ffmpeg:${hlsUrl}#video=h264&audio=aac\n`;
+    // video=h264 only — audio causes codec negotiation issues with MSE on some browsers
+    streamLines += `  ${name}:\n    - ffmpeg:${hlsUrl}#video=h264\n`;
   }
   const cfg = `api:
   listen: "127.0.0.1:1984"
@@ -139,15 +140,45 @@ async function g2rDeleteStream(name) {
   else if (g2rProc) { await killGo2rtc(); }
 }
 
+// ── Warmup: trigger go2rtc to start FFmpeg by opening a client connection ─────
+// go2rtc is lazy — it won't start FFmpeg until a consumer connects.
+// We connect briefly via HTTP to kick it off before the browser WebSocket arrives.
+async function g2rWarmup(name) {
+  console.log(`[GO2RTC] Warming up stream: ${name}`);
+  return new Promise(resolve => {
+    const req = http.get(`http://127.0.0.1:1984/api/stream.mp4?src=${name}`, res => {
+      console.log(`[GO2RTC] Warmup HTTP status for ${name}: ${res.statusCode}`);
+      // Drain briefly then destroy — we just need FFmpeg to start
+      res.on('data', () => {});
+      setTimeout(() => { res.destroy(); resolve(); }, 2500);
+    });
+    req.on('error', err => {
+      console.warn(`[GO2RTC] Warmup error for ${name}:`, err.message);
+      resolve();
+    });
+    req.setTimeout(4000, () => { req.destroy(); resolve(); });
+  });
+}
+
+// ── Wait for producers to appear (FFmpeg actually connected) ──────────────────
 async function g2rStreamReady(name, retries = 20) {
   for (let i = 0; i < retries; i++) {
     try {
       const r = await axios.get(`${G2R}/api/streams`, { timeout: 3000 });
       const s = r.data?.[name];
       if (i === 0) console.log(`[GO2RTC] Streams:`, JSON.stringify(r.data).substring(0, 300));
-      if (s?.producers?.length > 0 || s?.tracks?.length > 0) return true;
+      // consumers !== null means a client is connected AND FFmpeg is piping data
+      if (s?.consumers !== null && s?.consumers !== undefined) {
+        console.log(`[GO2RTC] Stream ${name} has consumers — FFmpeg active`);
+        return true;
+      }
+      // Also check producers with tracks (stream is ready even without consumers)
+      if (s?.tracks?.length > 0) {
+        console.log(`[GO2RTC] Stream ${name} has tracks — ready`);
+        return true;
+      }
     } catch (_) {}
-    await sleep(1000);
+    await sleep(500);
   }
   return false;
 }
@@ -216,11 +247,14 @@ app.get('/api/stream/:deviceId', async (req, res) => {
   lock.connecting = true;
 
   try {
+    // Clean up any existing stream
     await g2rDeleteStream(deviceId);
 
+    // Unbind stale IMOU session
     const hadSession = await unbindCurrent(deviceId);
     if (hadSession) { await sleep(3000); }
 
+    // Get fresh HLS URL from IMOU
     const chosen = await bindAndGetUrl(deviceId, streamId);
     const { ok, body } = await fetchPlaylist(chosen.hls);
     console.log(`[STREAM:${deviceId}] Playlist:`, body.substring(0, 120).replace(/\n/g, ' | '));
@@ -230,10 +264,15 @@ app.get('/api/stream/:deviceId', async (req, res) => {
       return res.status(502).json({ error: 'Camera not ready — wait 15s and try again' });
     }
 
+    // Register stream in go2rtc
     await g2rAddStream(deviceId, chosen.hls);
 
-    g2rStreamReady(deviceId).then(ready => {
-      if (!ready) console.log(`[GO2RTC] Warning: stream ${deviceId} never showed producers`);
+    // Warmup: connect as HTTP client to force FFmpeg to start
+    await g2rWarmup(deviceId);
+
+    // Wait for stream to be active (non-blocking — browser can connect while we wait)
+    g2rStreamReady(deviceId, 30).then(ready => {
+      console.log(`[GO2RTC] Stream ${deviceId} ready: ${ready}`);
     });
 
     res.json({
