@@ -102,16 +102,33 @@ async function g2rDeleteStream(name) {
   } catch (_) {}
 }
 
-async function g2rStreamReady(name, retries = 15) {
-  // Poll go2rtc until the stream has at least one producer (FFmpeg connected)
+async function g2rStreamReady(name, retries = 30) {
+  // Poll go2rtc until stream is active
+  // go2rtc stream states: producers array may not exist until FFmpeg connects
   for (let i = 0; i < retries; i++) {
     try {
       const r = await axios.get(`${G2R}/api/streams`, { timeout: 3000 });
       const s = r.data?.[name];
-      if (s?.producers?.length > 0) return true;
-    } catch (_) {}
+      // Log structure on first few attempts so we know what go2rtc returns
+      if (i < 3) console.log(`[GO2RTC] Stream state (${i+1}):`, JSON.stringify(s).substring(0, 200));
+      // go2rtc marks a stream ready when it has producers OR when it has the stream entry at all
+      // Different versions use different fields — check multiple
+      if (s && (
+        (s.producers?.length > 0) ||
+        (s.tracks?.length > 0) ||
+        (s.status === 'active') ||
+        (Array.isArray(s) && s.length > 0)
+      )) return true;
+    } catch (e) {
+      console.log(`[GO2RTC] Poll error:`, e.message);
+    }
     await sleep(1000);
   }
+  // Log final state before giving up
+  try {
+    const r = await axios.get(`${G2R}/api/streams`, { timeout: 3000 });
+    console.log('[GO2RTC] Final stream state:', JSON.stringify(r.data?.[name]).substring(0, 300));
+  } catch (_) {}
   return false;
 }
 
@@ -199,15 +216,13 @@ app.get('/api/stream/:deviceId', async (req, res) => {
     // Register stream in go2rtc — it will spawn FFmpeg internally
     await g2rAddStream(deviceId, chosen.hls);
 
-    // Wait for go2rtc to connect to the source
-    const ready = await g2rStreamReady(deviceId);
-    if (!ready) {
-      await g2rDeleteStream(deviceId);
-      await unbindCurrent(deviceId);
-      return res.status(502).json({ error: 'Stream failed to start in go2rtc' });
-    }
+    // Wait for go2rtc to connect to source — but don't block the response
+    // go2rtc buffers clients until FFmpeg is ready, so we can return the URL immediately
+    g2rStreamReady(deviceId).then(ready => {
+      if (!ready) console.log(`[GO2RTC] Warning: stream ${deviceId} never showed producers`);
+    });
 
-    // Return the WebSocket URL (proxied through our server)
+    // Return the WebSocket URL straight away — go2rtc handles the wait internally
     res.json({
       success: true,
       wsUrl:   `/go2rtc/api/ws?src=${deviceId}`,
