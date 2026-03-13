@@ -88,11 +88,16 @@ streams: {}
 async function g2rAddStream(name, hlsUrl) {
   // go2rtc ffmpeg source — transcode HEVC→H264
   const src = `ffmpeg:${hlsUrl}#video=h264`;
-  // go2rtc API: PUT /api/streams?name=NAME&src=SOURCE (both as query params)
-  await axios.put(`${G2R}/api/streams`, null, {
-    params: { name, src }
-  });
-  console.log(`[GO2RTC] Stream added: ${name}`);
+  const url  = `${G2R}/api/streams`;
+  console.log(`[GO2RTC] PUT ${url} name=${name} src=${src.substring(0, 80)}`);
+  try {
+    const r = await axios.put(url, null, { params: { name, src } });
+    console.log(`[GO2RTC] Stream added: ${name} status=${r.status}`);
+  } catch (e) {
+    const body = e.response?.data ? JSON.stringify(e.response.data).substring(0, 200) : e.message;
+    console.error(`[GO2RTC] Add stream failed: status=${e.response?.status} body=${body}`);
+    throw e;
+  }
 }
 
 async function g2rDeleteStream(name) {
